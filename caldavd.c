@@ -1119,7 +1119,7 @@ VOID HandleCommandLine(ClientThreadCtx* ctx, char* buffer, char* response, const
         
         if (hFind != INVALID_HANDLE_VALUE) {
             do {
-                if (strcmp(fd.cFileName, "people.json") == 0) continue;
+                if (strcmp(fd.cFileName, "people.json") == 0 || strcmp(fd.cFileName, "contacts.json") == 0) continue;
                 
                 char filepath[MAX_PATH];
                 snprintf(filepath, sizeof(filepath), "%s/%s", DATA_DIR, fd.cFileName);
@@ -1232,6 +1232,24 @@ VOID HandleCommandLine(ClientThreadCtx* ctx, char* buffer, char* response, const
             SendHTTPResponse(ctx, "200 OK", "application/json", json, strlen(json), NULL);
             return;
         }
+        else if (strcmp(path, "/api/contacts") == 0) {
+            char filepath[MAX_PATH];
+            snprintf(filepath, sizeof(filepath), "%s/contacts.json", DATA_DIR);
+            FILE* fp = fopen(filepath, "rb");
+            if (fp) {
+                fseek(fp, 0, SEEK_END); long size = ftell(fp); fseek(fp, 0, SEEK_SET);
+                char* fileBuf = malloc(size + 1);
+                if (fileBuf) {
+                    fread(fileBuf, 1, size, fp); fileBuf[size] = '\0';
+                    SendHTTPResponse(ctx, "200 OK", "application/json", fileBuf, size, NULL);
+                    free(fileBuf);
+                }
+                fclose(fp);
+            } else {
+                SendHTTPResponse(ctx, "200 OK", "application/json", "[]", 2, NULL);
+            }
+            return;
+        }
         else if (strcmp(path, "/calendar/all") == 0) {
             char* responseBody = (char*)malloc(1024 * 1024);
             if (responseBody) {
@@ -1243,7 +1261,7 @@ VOID HandleCommandLine(ClientThreadCtx* ctx, char* buffer, char* response, const
                 int first = 1;
                 if (hFind != INVALID_HANDLE_VALUE) {
                     do {
-                        if (strcmp(fd.cFileName, "people.json") == 0) continue;
+                        if (strcmp(fd.cFileName, "people.json") == 0 || strcmp(fd.cFileName, "contacts.json") == 0) continue;
                         char filepath[MAX_PATH];
                         snprintf(filepath, sizeof(filepath), "%s/%s", DATA_DIR, fd.cFileName);
                         FILE* fp = fopen(filepath, "rb");
@@ -1289,7 +1307,20 @@ VOID HandleCommandLine(ClientThreadCtx* ctx, char* buffer, char* response, const
         else { SendHTTPResponse(ctx, "404 Not Found", "text/plain", "Endpoint not found", 18, NULL); }
     }
     else if (strcmp(method, "PUT") == 0) {
-        if (strcmp(path, "/api/user") == 0) {
+        if (strcmp(path, "/api/contacts") == 0) {
+            if (body && contentLen > 0) {
+                char filepath[MAX_PATH];
+                snprintf(filepath, sizeof(filepath), "%s/contacts.json", DATA_DIR);
+                FILE* fp = fopen(filepath, "wb");
+                if (fp) {
+                    fwrite(body, 1, contentLen, fp);
+                    fclose(fp);
+                }
+            }
+            SendHTTPResponse(ctx, "200 OK", "text/plain", "Saved", 5, NULL);
+            return;
+        }
+        else if (strcmp(path, "/api/user") == 0) {
             if (body && contentLen > 0) {
                 char* safeBody = malloc(contentLen + 1);
                 memcpy(safeBody, body, contentLen);
@@ -1433,7 +1464,7 @@ VOID HandleCommandLine(ClientThreadCtx* ctx, char* buffer, char* response, const
                         char* nextObj = strstr(eventStart + 1, "{\"id\":");
                         if (strcmp(currentId, uid) != 0) {
                             if (!first) strcat(outBuf, ",");
-                            int copyLen = nextObj ? (int)(nextObj - eventStart) : (int)strlen(eventStart);
+                            size_t copyLen = nextObj ? (size_t)(nextObj - eventStart) : strlen(eventStart);
                             while (copyLen > 0 && (eventStart[copyLen-1] == ']' || eventStart[copyLen-1] == ',' || eventStart[copyLen-1] == ' ' || eventStart[copyLen-1] == '\r' || eventStart[copyLen-1] == '\n')) {
                                 copyLen--;
                             }
@@ -1499,7 +1530,7 @@ VOID HandleCommandLine(ClientThreadCtx* ctx, char* buffer, char* response, const
             
             if (hFind != INVALID_HANDLE_VALUE) {
                 do {
-                    if (strcmp(fd.cFileName, "people.json") == 0) continue;
+                    if (strcmp(fd.cFileName, "people.json") == 0 || strcmp(fd.cFileName, "contacts.json") == 0) continue;
                     
                     char filepath[MAX_PATH];
                     snprintf(filepath, sizeof(filepath), "%s/%s", DATA_DIR, fd.cFileName);
@@ -1524,7 +1555,7 @@ VOID HandleCommandLine(ClientThreadCtx* ctx, char* buffer, char* response, const
                                 char* nextObj = strstr(eventStart + 1, "{\"id\":");
                                 if (strcmp(currentId, uid) != 0) {
                                     if (!first) strcat(outBuf, ",");
-                                    int copyLen = nextObj ? (int)(nextObj - eventStart) : (int)strlen(eventStart);
+                                    size_t copyLen = nextObj ? (size_t)(nextObj - eventStart) : strlen(eventStart);
                                     while (copyLen > 0 && (eventStart[copyLen-1] == ']' || eventStart[copyLen-1] == ',' || eventStart[copyLen-1] == ' ' || eventStart[copyLen-1] == '\r' || eventStart[copyLen-1] == '\n')) {
                                         copyLen--;
                                     }

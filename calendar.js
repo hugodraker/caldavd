@@ -1,3 +1,11 @@
+<!--  ============================================================================ -->
+//    CalDAV Server & HTTP Web Server - Front End GUI
+ 
+//    2026 HUGO
+  
+//    THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
+//    AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
+<!--  ============================================================================ -->
 const hostname = window.location.hostname || "127.0.0.1";
 const CALDAV_URL = window.location.origin + '/calendar/';
 const CONFIG_URL = window.location.origin + '/config/';
@@ -6,6 +14,7 @@ let viewMode = 3;
 let currentDate = new Date();
 let selectedEventId = null;
 let events = [];
+let contacts = [];
 
 let isDragging = false, isResizing = false;
 let isMonthDragging = false, monthDragEv = null;
@@ -22,6 +31,13 @@ let visiblePeopleIndices = [];
 let authHeader = sessionStorage.getItem('caldav_auth') || "";
 function getAuthHeader() { return authHeader; }
 
+// Global Delete Key Binding
+window.addEventListener('keydown', (e) => {
+    if (e.key === 'Delete' && selectedEventId && !window.isEditing && document.activeElement.tagName !== 'INPUT') {
+        document.getElementById('btnDelete')?.click();
+    }
+});
+
 document.getElementById('btnLogin')?.addEventListener('click', () => {
     let u = document.getElementById('loginUser').value;
     let p = document.getElementById('loginPass').value;
@@ -35,6 +51,7 @@ document.getElementById('btnLogout')?.addEventListener('click', () => {
     sessionStorage.removeItem('caldav_auth');
     authHeader = "";
     events = []; 
+    contacts = [];
     currentUser = "";
     render(); 
     document.getElementById('loginModal').style.display = 'block';
@@ -235,6 +252,11 @@ async function downloadUpdates() {
                 for(let i = 0; i < serverPeople.length; i++) people[i] = serverPeople[i];
             } catch (e) {}
         }
+
+        const cRes = await fetch(`${window.location.origin}/api/contacts?t=${Date.now()}`, { headers, cache: 'no-store' });
+        if (cRes.ok) {
+            try { contacts = await cRes.json(); } catch(e) { contacts = []; }
+        }
         
         let myIdx = people.indexOf(currentUser);
         if (myIdx === -1 && currentUser && currentUser !== "anonymous") {
@@ -311,6 +333,44 @@ async function deleteEventFromCalDAV(evToDel) {
         }
     } catch (e) {}
 }
+
+function renderContactsList() {
+    const list = document.getElementById('contactsList');
+    if (!list) return;
+    list.innerHTML = '';
+    contacts.forEach((c, idx) => {
+        let div = document.createElement('div');
+        div.style.display = 'flex';
+        div.style.gap = '6px';
+        div.style.marginBottom = '6px';
+        div.innerHTML = `
+            <input type="text" placeholder="Short Name (e.g. Jack)" value="${c.username || ''}" onchange="contacts[${idx}].username=this.value" style="width:30%; margin:0;">
+            <input type="text" placeholder="Full Name" value="${c.fullname || ''}" onchange="contacts[${idx}].fullname=this.value" style="width:40%; margin:0;">
+            <input type="text" placeholder="Email" value="${c.email || ''}" onchange="contacts[${idx}].email=this.value" style="width:30%; margin:0;">
+            <button onclick="contacts.splice(${idx}, 1); renderContactsList();" style="cursor:pointer; color:red; font-weight:bold; border:1px solid #ccc; border-radius:3px; padding:0 8px;">X</button>
+        `;
+        list.appendChild(div);
+    });
+}
+
+document.getElementById('btnContacts')?.addEventListener('click', () => {
+    renderContactsList();
+    document.getElementById('contactsModal').style.display = 'block';
+});
+
+document.getElementById('btnAddContact')?.addEventListener('click', () => {
+    contacts.push({ username: "", fullname: "", email: "" });
+    renderContactsList();
+});
+
+document.getElementById('btnSaveContacts')?.addEventListener('click', async () => {
+    await fetch(`${window.location.origin}/api/contacts`, {
+        method: 'PUT',
+        headers: { 'Authorization': getAuthHeader(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(contacts)
+    });
+    document.getElementById('contactsModal').style.display = 'none';
+});
 
 function renderTimeline() {
     if (!gridBg || !timelineLabels || !headerRow) return;
@@ -483,6 +543,7 @@ function renderTimeline() {
         }
     });
 }
+
 function renderMonth() {
     if (!gridBg || !headerRow || !timelineLabels) return;
     
@@ -512,7 +573,7 @@ function renderMonth() {
     let daysInMonth = new Date(y, m + 1, 0).getDate();
     
     let cellCount = 0;
-    let displayEvents = unrollEvents();
+    let displayEvents = typeof unrollEvents === 'function' ? unrollEvents() : events;
     let myIdx = people.indexOf(currentUser);
 
     for (let row = 0; row < 6; row++) {
@@ -668,7 +729,7 @@ function renderUpcoming() {
     let container = document.createElement('div');
     container.className = 'upcoming-list';
     
-    let displayEvents = unrollEvents();
+    let displayEvents = typeof unrollEvents === 'function' ? unrollEvents() : events;
     let myIdx = people.indexOf(currentUser);
     
     let validEvents = displayEvents.filter(e => {
@@ -805,7 +866,6 @@ function handleMove(e) {
         if (isPeopleView()) {
             let tgtIdx = visiblePeopleIndices[newColIdx];
             if (!canEditAll && tgtIdx !== people.indexOf(currentUser)) {
-                // Ignore horizontal drag if they aren't allowed to assign to others
             } else {
                 activeEv.personIdx = tgtIdx;
             }
@@ -1088,7 +1148,7 @@ document.getElementById('btnPrint')?.addEventListener('click', () => {
     let w = 612, h = 792; 
     let rPage = { left: 18, top: 18, right: w - 18, bottom: h - 18 };
     
-    let titleH = 32, subH = 25;
+    let titleH = 45, subH = 25; 
     let gridTop = rPage.top + titleH + subH;
     let gridH = rPage.bottom - gridTop;
     
@@ -1103,6 +1163,13 @@ document.getElementById('btnPrint')?.addEventListener('click', () => {
     doc.setFontSize(18);
     doc.setTextColor(32, 33, 36);
     if (lblDateTitle) doc.text(lblDateTitle.innerText, rPage.left, rPage.top + 18);
+
+    let combo = document.getElementById('comboView');
+    let viewDesc = combo.options[combo.selectedIndex].text;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(11);
+    doc.setTextColor(112, 117, 122);
+    doc.text(`Calendar Profile: ${viewDesc}`, rPage.left, rPage.top + 34);
 
     doc.setFillColor(248, 249, 250);
     doc.rect(rPage.left + timeColW, rPage.top + titleH, rPage.right - (rPage.left + timeColW), subH, "F");
@@ -1134,7 +1201,17 @@ document.getElementById('btnPrint')?.addEventListener('click', () => {
         doc.line(x, rPage.top + titleH, x, rPage.bottom);
         
         if (c < activeCols) {
-            let hdr = isPeopleView() ? people[visiblePeopleIndices[c]] : (() => { let d = new Date(currentDate); d.setDate(d.getDate() + c); return d.toLocaleDateString(undefined, {weekday:'short', month:'numeric', day:'numeric'}); })();
+            let hdr = "";
+            if (isPeopleView()) {
+                let shortName = people[visiblePeopleIndices[c]];
+                let contactMatch = contacts.find(contact => contact.username === shortName);
+                hdr = (contactMatch && contactMatch.fullname) ? contactMatch.fullname : shortName;
+            } else {
+                let d = new Date(currentDate); 
+                d.setDate(d.getDate() + c); 
+                hdr = d.toLocaleDateString(undefined, {weekday:'short', month:'numeric', day:'numeric'});
+            }
+            
             doc.setFont("helvetica", "bold");
             doc.setFontSize(11);
             doc.setTextColor(60, 64, 67);
@@ -1183,8 +1260,10 @@ document.getElementById('btnPrint')?.addEventListener('click', () => {
 
     let pdfName = "Schedule.pdf";
     if (visiblePeopleIndices.length === 1) {
-        let pName = people[visiblePeopleIndices[0]] || currentUser || "Calendar";
-        pdfName = pName.replace(/[^a-z0-9]/gi, '_') + "_Schedule.pdf";
+        let shortName = people[visiblePeopleIndices[0]] || currentUser || "Calendar";
+        let contactMatch = contacts.find(c => c.username === shortName);
+        let finalName = (contactMatch && contactMatch.fullname) ? contactMatch.fullname : shortName;
+        pdfName = finalName.replace(/[^a-z0-9]/gi, '_') + "_Schedule.pdf";
     } else if (currentUser) {
         pdfName = currentUser.replace(/[^a-z0-9]/gi, '_') + "_Schedule.pdf";
     }
@@ -1193,7 +1272,7 @@ document.getElementById('btnPrint')?.addEventListener('click', () => {
 
 document.getElementById('btnExport')?.addEventListener('click', () => {
     let content = "========================================\r\n           UPCOMING SCHEDULE            \r\n========================================\r\n\r\n";
-    let displayEvents = unrollEvents();
+    let displayEvents = typeof unrollEvents === 'function' ? unrollEvents() : events;
     let sorted = displayEvents.filter(e => e.date >= formatDate(new Date())).sort((a,b) => a.date.localeCompare(b.date) || a.startMin - b.startMin);
     
     sorted.forEach(e => {
