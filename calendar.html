@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <title>CalDAV Web Client</title>
+    <!-- Loads locally to bypass Tracking Prevention -->
+    <script src="jspdf.umd.min.js"></script>
+    <style>
+        * { box-sizing: border-box; font-family: 'Segoe UI', sans-serif; user-select: none; }
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #fff; touch-action: none; }
+        #mobile-header { display: flex; align-items: center; padding: 5px 10px; background: #f1f3f4; border-bottom: 1px solid #dadce0; height: 44px; width: 100%; gap: 10px; z-index: 60; position: relative; }
+        #btnMenu { padding: 4px 6px; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+        #comboView { padding: 2px 4px; font-size: 13px; height: 26px; border: 1px solid #ccc; border-radius: 3px; background: #fff; cursor: pointer; }
+        #lblDateTitleMobile { font-size: 16px; font-weight: bold; color: #202124; flex: 1; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        
+        #toolbar { display: none; height: auto; min-height: 36px; background: #f1f3f4; border-bottom: 1px solid #dadce0; align-items: center; padding: 6px 10px; gap: 6px; flex-wrap: wrap; width: 100%; z-index: 55; position: relative; }
+        .toolbar-group { display: flex; gap: 4px; }
+        #toolbar button, #toolbar input { min-height: 26px; font-size: 11px; padding: 4px 8px; }
+        #toolbar button { cursor: pointer; border: 1px solid #ccc; background: #fff; border-radius: 3px; }
+        #toolbar button:hover { background: #e8eaed; }
+        #lblDateTitle { display: none; } 
+
+        #canvas-container { height: calc(100vh - 44px); display: block; overflow-y: auto; overflow-x: hidden; position: relative; width: 100%; }
+        #header-row { position: sticky; top: 0; z-index: 50; height: 30px; background: #f8f9fa; border-bottom: 1px solid #dadce0; display: flex; padding-left: 65px; width: 100%; box-sizing: border-box; }
+        .col-header { flex: 1; text-align: center; font-size: 13px; font-weight: 600; color: #3c4043; line-height: 30px; border-right: 1px solid #dadce0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+        #scroll-area { position: relative; display: flex; width: 100%; height: auto; overflow: visible; }
+        #timeline-labels { width: 65px; flex-shrink: 0; position: relative; background: #fff; border-right: 1px solid #dadce0; }
+        .time-label { position: absolute; right: 8px; font-size: 12px; color: #70757a; transform: translateY(-50%); }
+
+        #grid-bg { flex: 1; position: relative; background-image: linear-gradient(#e0e0e0 1px, transparent 1px), linear-gradient(90deg, #dadce0 1px, transparent 1px); background-size: 100% 60px, calc(100% / 7) 100%; }
+        #events-layer { position: absolute; top: 0; left: 65px; right: 0; bottom: 0; pointer-events: none; }
+
+        .event-card { position: absolute; border-radius: 4px; padding: 4px 8px; font-size: 12px; color: #fff; pointer-events: auto; cursor: grab; box-shadow: 0 1px 3px rgba(0,0,0,0.2); overflow: hidden; display: block; }
+        .event-card:active { cursor: grabbing; opacity: 0.9; }
+        .event-card.selected { outline: 2px solid #000; z-index: 10; }
+        .event-title { font-weight: 600; margin-bottom: 2px; pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .event-time { font-size: 11px; opacity: 0.9; pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .resize-handle { position: absolute; bottom: 0; left: 0; right: 0; height: 12px; cursor: ns-resize; background: rgba(0,0,0,0.1); z-index: 5; }
+        .resize-handle:hover { background: rgba(0,0,0,0.3); }
+
+        .month-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); grid-template-rows: repeat(6, minmax(0, 1fr)); height: 100%; width: 100%; }
+        .month-cell { border-right: 1px solid #dadce0; border-bottom: 1px solid #dadce0; padding: 4px; position: relative; transition: background 0.1s; }
+        .month-day-num { text-align: right; font-size: 12px; font-weight: 600; color: #3c4043; margin-bottom: 4px; }
+        .month-event { border-radius: 3px; font-size: 11px; padding: 2px 4px; margin-bottom: 2px; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+
+        .upcoming-list { padding: 20px; overflow-y: auto; height: 100%; width: 100%; }
+        .upcoming-card { border: 1px solid #dadce0; border-radius: 8px; margin-bottom: 12px; padding: 12px; display: flex; background: #f8f9fa; }
+        .upcoming-color { width: 12px; border-radius: 4px; margin-right: 12px; }
+        .upcoming-details h3 { margin: 0 0 4px 0; font-size: 16px; color: #202124; }
+        .upcoming-details p { margin: 0; font-size: 13px; color: #5f6368; }
+
+        .modal { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #fff; padding: 24px; border: 1px solid #dadce0; border-radius: 8px; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.15); width: 320px; }
+        .modal h3 { margin-top: 0; color: #202124; }
+        .modal input[type="text"], .modal input[type="password"] { width: 100%; margin-bottom: 12px; padding: 6px; border: 1px solid #ccc; border-radius: 4px; }
+        .modal-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+        
+        .chk-list { max-height: 200px; overflow-y: auto; text-align: left; margin-bottom: 12px; border: 1px solid #ccc; padding: 8px; }
+        .chk-list div { margin-bottom: 6px; }
+        .chk-list label { margin-left: 6px; cursor: pointer; }
+
+        @media (max-width: 768px) {
+            #toolbar { position: absolute; top: 44px; left: 0; right: 0; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+            #canvas-container { height: calc(100vh - 44px); }
+            #timeline-labels { width: 40px; }
+            #header-row { padding-left: 40px; height: 24px; }
+            .col-header { font-size: 10px; line-height: 24px; padding: 0 1px; }
+            #events-layer { left: 40px; }
+            .time-label { font-size: 10px; right: 4px; }
+            .event-card { padding: 2px; font-size: 10px; }
+            .event-title { font-size: 11px; margin-bottom: 0px; }
+            .event-time { font-size: 9px; }
+        }
+    </style>
+</head>
+<body>
+    <div id="mobile-header">
+        <button id="btnMenu" title="Toggle Menu">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+        </button>
+        <select id="comboView">
+            <option value="1">1 Day View</option>
+            <option value="2">4 Day View</option>
+            <option value="3" selected>Week View</option>
+            <option value="4">People View</option>
+            <option value="6">Month View</option>
+            <option value="7">Upcoming Schedule</option>
+        </select>
+        <button id="btnFilterPeople" style="display: none; height: 26px; padding: 2px 4px; font-size: 11px; cursor: pointer; border: 1px solid #ccc; background: #fff; border-radius: 3px;">Filter People</button>
+        <div id="lblDateTitleMobile"></div>
+    </div>
+    
+    <div id="toolbar" data-open="false">
+        <div class="toolbar-group">
+            <button id="btnZoomIn">+</button>
+            <button id="btnZoomOut">-</button>
+        </div>
+        <div class="toolbar-group">
+            <button id="btnPrev">&lt; Prev</button>
+            <button id="btnNext">Next &gt;</button>
+        </div>
+        <div id="lblDateTitle"></div>
+        <button id="btnSync">Sync (Download)</button>
+        <button id="btnImportRemote">Import Remote Server</button>
+        <button id="btnCopy">Copy Selected</button>
+        <button id="btnDelete">Delete Selected</button>
+        <button id="btnPrint">Save PDF</button>
+        <button id="btnExport">Export</button>
+        <button id="btnLogout" style="color: red; font-weight: bold;">Logout</button>
+    </div>
+    
+    <div id="canvas-container">
+        <div id="header-row"></div>
+        <div id="scroll-area">
+            <div id="timeline-labels"></div>
+            <div id="grid-bg"></div>
+            <div id="events-layer"></div>
+        </div>
+    </div>
+
+    <div id="loginModal" class="modal">
+        <h3>Authentication Required</h3>
+        <label>Username:</label>
+        <input type="text" id="loginUser">
+        <label>Password:</label>
+        <input type="password" id="loginPass">
+        <div class="modal-buttons">
+            <button id="btnLogin">Login</button>
+        </div>
+    </div>
+
+    <div id="remoteModal" class="modal">
+        <h3>Import Remote CalDAV</h3>
+        <label>Server URL:</label>
+        <input type="text" id="remUrl" placeholder="http://remote-server.local/calendar/">
+        <label>Port:</label>
+        <input type="text" id="remPort" value="8080">
+        <label>Username:</label>
+        <input type="text" id="remUser">
+        <label>Password:</label>
+        <input type="password" id="remPass">
+        <div class="modal-buttons">
+            <button onclick="document.getElementById('remoteModal').style.display='none'">Cancel</button>
+            <button id="btnDoImport">Import & Save Config</button>
+        </div>
+    </div>
+
+    <div id="peopleFilterModal" class="modal">
+        <h3>Select Visible People</h3>
+        <div id="peopleFilterList" class="chk-list"></div>
+        <div class="modal-buttons">
+            <button onclick="document.getElementById('peopleFilterModal').style.display='none'">Close</button>
+            <button id="btnSavePeopleFilter">Save Filter</button>
+        </div>
+    </div>
+
+    <script src="calendar.js"></script>
+</body>
+</html>
