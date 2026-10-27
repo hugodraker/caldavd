@@ -104,6 +104,68 @@ function getColCount() {
 function isPeopleView() { return viewMode === 4; }
 function canEdit(ev) { return canEditAll || ev.personIdx === people.indexOf(currentUser); }
 
+function unrollEvents() {
+    let unrolled = [];
+    let winStartMs = new Date(currentDate.getFullYear(), currentDate.getMonth() - 2, 1).getTime();
+    let winEndMs = new Date(currentDate.getFullYear(), currentDate.getMonth() + 2, 0).getTime();
+    if (viewMode === 7) winEndMs = new Date(currentDate.getFullYear() + 1, currentDate.getMonth(), 1).getTime();
+
+    events.forEach(ev => {
+        if (!ev.rrule) {
+            unrolled.push({ ...ev, realId: ev.id });
+            return;
+        }
+
+        let rules = {};
+        ev.rrule.split(';').forEach(part => {
+            let [key, val] = part.split('=');
+            if (key && val) rules[key.toUpperCase()] = val;
+        });
+
+        let freq = rules['FREQ'];
+        let interval = parseInt(rules['INTERVAL'] || '1', 10);
+        let count = rules['COUNT'] ? parseInt(rules['COUNT'], 10) : Infinity;
+        
+        let untilMs = Infinity;
+        if (rules['UNTIL']) {
+            let u = rules['UNTIL'];
+            let uYear = parseInt(u.substring(0,4), 10);
+            let uMon = parseInt(u.substring(4,6), 10) - 1;
+            let uDay = parseInt(u.substring(6,8), 10);
+            untilMs = new Date(uYear, uMon, uDay, 23, 59, 59).getTime();
+        }
+
+        let [y, m, d] = ev.date.split('/').map(Number);
+        let currentInst = new Date(y, m - 1, d);
+        let instanceCount = 0;
+
+        while (currentInst.getTime() <= winEndMs && currentInst.getTime() <= untilMs && instanceCount < count) {
+            if (currentInst.getTime() >= winStartMs) {
+                unrolled.push({
+                    ...ev,
+                    id: ev.id + "_r" + instanceCount,
+                    realId: ev.id,
+                    date: formatDate(currentInst)
+                });
+            }
+            
+            if (freq === 'DAILY') {
+                currentInst.setDate(currentInst.getDate() + interval);
+            } else if (freq === 'WEEKLY') {
+                currentInst.setDate(currentInst.getDate() + (7 * interval));
+            } else if (freq === 'MONTHLY') {
+                currentInst.setMonth(currentInst.getMonth() + interval);
+            } else if (freq === 'YEARLY') {
+                currentInst.setFullYear(currentInst.getFullYear() + interval);
+            } else { break; }
+            
+            instanceCount++;
+            if (instanceCount > 730) break;
+        }
+    });
+    return unrolled;
+}
+
 document.getElementById('btnImportRemote')?.addEventListener('click', () => {
     const modal = document.getElementById('remoteModal');
     if (modal) modal.style.display = 'block';
@@ -253,6 +315,11 @@ async function deleteEventFromCalDAV(evToDel) {
 function renderTimeline() {
     if (!gridBg || !timelineLabels || !headerRow) return;
     
+    let myIdx = people.indexOf(currentUser);
+    if (myIdx !== -1 && !visiblePeopleIndices.includes(myIdx)) {
+        visiblePeopleIndices.push(myIdx);
+    }
+
     let cols = getColCount();
     let activeCols = isPeopleView() ? visiblePeopleIndices.length : cols;
     if (activeCols === 0) activeCols = 1;
@@ -275,11 +342,29 @@ function renderTimeline() {
                 div.appendChild(input);
                 input.focus();
                 
-                input.onblur = input.onkeydown = (ev) => {
+                input.onblur = input.onkeydown = async (ev) => {
                     if (ev.type === 'keydown' && ev.key !== 'Enter') return;
                     input.onblur = null; input.onkeydown = null;
-                    people[pIdx] = input.value || `Person ${pIdx + 1}`;
+                    
+                    let oldName = people[pIdx] || "";
+                    let newName = input.value.trim() || `Person ${pIdx + 1}`;
+                    while (people.length <= pIdx) {
+                        people.push(`Person ${people.length + 1}`);
+                    }
+                    people[pIdx] = newName;
                     putPeopleToCalDAV();
+                    
+                    if (newName !== oldName) {
+                        try {
+                            let payload = oldName ? `${oldName}|${newName}` : newName;
+                            await fetch(`${window.location.origin}/api/user`, {
+                                method: 'PUT',
+                                headers: { 'Authorization': getAuthHeader() },
+                                body: payload
+                            });
+                        } catch(e) {}
+                    }
+                    
                     render();
                 };
             };
@@ -311,7 +396,19 @@ function renderTimeline() {
     
     if (eventsLayer) eventsLayer.innerHTML = '';
 
-    events.forEach(ev => {
+    let displayEvents = typeof unrollEvents === 'function' ? unrollEvents() : events;
+
+    displayEvents.forEach(ev => {
+        if (!isPeopleView() && viewMode <= 3) {
+            if (myIdx !== -1 && ev.personIdx !== myIdx && visiblePeopleIndices.length > 0 && !visiblePeopleIndices.includes(ev.personIdx)) {
+                return;
+            }
+        } else if (isPeopleView()) {
+            if (visiblePeopleIndices.length > 0 && !visiblePeopleIndices.includes(ev.personIdx)) {
+                return;
+            }
+        }
+
         let colIdx = -1;
         if (isPeopleView()) {
             if (ev.date === formatDate(currentDate)) {
@@ -367,8 +464,12 @@ function renderTimeline() {
                 input.onblur = input.onkeydown = (keyEv) => {
                     if (keyEv.type === 'keydown' && keyEv.key !== 'Enter') return;
                     input.onblur = null; input.onkeydown = null;
-                    ev.title = input.value || "Untitled Event";
-                    putEventToCalDAV(ev);
+                    let realId = ev.id.includes('_r') ? ev.id.split('_r')[0] : ev.id;
+                    let targetEv = events.find(x => x.id === realId);
+                    if (targetEv) {
+                        targetEv.title = input.value || "Untitled Event";
+                        putEventToCalDAV(targetEv);
+                    }
                     window.isEditing = false;
                     render();
                 };
@@ -382,7 +483,6 @@ function renderTimeline() {
         }
     });
 }
-
 function renderMonth() {
     if (!gridBg || !headerRow || !timelineLabels) return;
     
@@ -412,6 +512,9 @@ function renderMonth() {
     let daysInMonth = new Date(y, m + 1, 0).getDate();
     
     let cellCount = 0;
+    let displayEvents = unrollEvents();
+    let myIdx = people.indexOf(currentUser);
+
     for (let row = 0; row < 6; row++) {
         for (let col = 0; col < 7; col++) {
             let cell = document.createElement('div');
@@ -440,7 +543,14 @@ function renderMonth() {
             cell.dataset.date = cellDateStr;
             cell.dataset.other = isOtherMonth ? 'true' : 'false';
             
-            events.filter(e => e.date === cellDateStr).forEach(ev => {
+            let validEvents = displayEvents.filter(e => {
+                if (e.date !== cellDateStr) return false;
+                if (myIdx !== -1 && e.personIdx === myIdx) return true;
+                if (visiblePeopleIndices.length > 0 && !visiblePeopleIndices.includes(e.personIdx)) return false;
+                return true;
+            });
+            
+            validEvents.forEach(ev => {
                 let evDiv = document.createElement('div');
                 evDiv.className = 'month-event';
                 evDiv.style.backgroundColor = ev.color;
@@ -480,20 +590,39 @@ function renderMonth() {
                     input.onblur = input.onkeydown = (keyEv) => {
                         if (keyEv.type === 'keydown' && keyEv.key !== 'Enter') return;
                         input.onblur = null; input.onkeydown = null;
-                        ev.title = input.value || "Untitled Event";
-                        putEventToCalDAV(ev);
+                        
+                        let realId = ev.id.includes('_r') ? ev.id.split('_r')[0] : ev.id;
+                        let targetEv = events.find(x => x.id === realId);
+                        if (targetEv) {
+                            targetEv.title = input.value || "Untitled Event";
+                            putEventToCalDAV(targetEv);
+                        }
                         window.isEditing = false;
                         render();
                     };
                 };
-
                 cell.appendChild(evDiv);
             });
             
             cell.ondblclick = () => {
-                let myIdx = people.indexOf(currentUser);
-                if (myIdx === -1) myIdx = 0;
-                let newEv = { id: Date.now().toString(), title: "New Event", startMin: 540, duration: 60, color: colors[events.length % colors.length], date: cellDateStr, personIdx: myIdx };
+                let targetIdx = people.indexOf(currentUser);
+                if (targetIdx === -1 && currentUser) {
+                    targetIdx = people.length;
+                    people.push(currentUser);
+                    putPeopleToCalDAV();
+                } else if (targetIdx === -1) {
+                    targetIdx = 0; 
+                }
+                
+                let newEv = { 
+                    id: Date.now().toString(), 
+                    title: "New Event", 
+                    startMin: 540, 
+                    duration: 60, 
+                    color: colors[events.length % colors.length], 
+                    date: cellDateStr, 
+                    personIdx: targetIdx 
+                };
                 events.push(newEv);
                 putEventToCalDAV(newEv);
                 render();
@@ -513,9 +642,10 @@ function startMonthDrag(e) {
     e.stopPropagation();
     if (window.isEditing) return;
     selectedEventId = this.dataset.id;
-    monthDragEv = events.find(x => x.id === selectedEventId);
+    let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
+    monthDragEv = events.find(x => x.id === realId);
     
-    if (!canEdit(monthDragEv)) {
+    if (!monthDragEv || !canEdit(monthDragEv)) {
         monthDragEv = null;
         return;
     }
@@ -538,7 +668,17 @@ function renderUpcoming() {
     let container = document.createElement('div');
     container.className = 'upcoming-list';
     
-    let sorted = events.filter(e => e.date >= formatDate(new Date())).sort((a,b) => a.date.localeCompare(b.date) || a.startMin - b.startMin);
+    let displayEvents = unrollEvents();
+    let myIdx = people.indexOf(currentUser);
+    
+    let validEvents = displayEvents.filter(e => {
+        if (e.date < formatDate(new Date())) return false;
+        if (myIdx !== -1 && e.personIdx === myIdx) return true;
+        if (visiblePeopleIndices.length > 0 && !visiblePeopleIndices.includes(e.personIdx)) return false;
+        return true;
+    });
+    
+    let sorted = validEvents.sort((a,b) => a.date.localeCompare(b.date) || a.startMin - b.startMin);
     
     sorted.forEach(ev => {
         let card = document.createElement('div');
@@ -573,7 +713,8 @@ function handleDrag(e) {
     if (window.isEditing) return;
     
     selectedEventId = e.currentTarget.dataset.id;
-    activeEv = events.find(ev => ev.id === selectedEventId);
+    let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
+    activeEv = events.find(ev => ev.id === realId);
     if (!activeEv) return;
     
     if (!canEdit(activeEv)) {
@@ -608,7 +749,8 @@ function handleResize(e) {
     if (window.isEditing) return;
     activeCard = e.target.parentElement;
     selectedEventId = activeCard.dataset.id;
-    activeEv = events.find(ev => ev.id === selectedEventId);
+    let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
+    activeEv = events.find(ev => ev.id === realId);
     
     if (!activeEv || !canEdit(activeEv)) {
         activeEv = null;
@@ -760,7 +902,16 @@ if (gridBg) {
         if (!isPeopleView()) dt.setDate(dt.getDate() + colIdx);
         
         let pIdx = isPeopleView() ? visiblePeopleIndices[colIdx] : people.indexOf(currentUser);
-        if (pIdx === -1 || pIdx === undefined) pIdx = people.indexOf(currentUser);
+        if (pIdx === -1 || pIdx === undefined) {
+            pIdx = people.indexOf(currentUser);
+            if (pIdx === -1 && currentUser) {
+                pIdx = people.length;
+                people.push(currentUser);
+                putPeopleToCalDAV();
+            } else if (pIdx === -1) {
+                pIdx = 0;
+            }
+        }
         
         if (!canEditAll && pIdx !== people.indexOf(currentUser)) {
             alert("You can only create events on your own schedule.");
@@ -779,7 +930,8 @@ if (gridBg) {
 
 document.getElementById('comboView')?.addEventListener('change', e => { 
     viewMode = parseInt(e.target.value); 
-    document.getElementById('btnFilterPeople').style.display = (viewMode === 4) ? 'inline-block' : 'none';
+    document.getElementById('btnFilterPeople').style.display = 'inline-block';
+    document.getElementById('btnCloneForUsers').style.display = 'inline-block';
     render(); 
 });
 document.getElementById('btnPrev')?.addEventListener('click', () => { 
@@ -798,7 +950,8 @@ document.getElementById('btnSync')?.addEventListener('click', downloadUpdates);
 
 document.getElementById('btnCopy')?.addEventListener('click', () => {
     if (selectedEventId) {
-        let ev = events.find(e => e.id === selectedEventId);
+        let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
+        let ev = events.find(e => e.id === realId);
         if (ev && canEdit(ev)) {
             let newEv = { ...ev, id: Date.now().toString(), startMin: Math.min(1440 - ev.duration, ev.startMin + 30) };
             events.push(newEv);
@@ -811,10 +964,11 @@ document.getElementById('btnCopy')?.addEventListener('click', () => {
 
 document.getElementById('btnDelete')?.addEventListener('click', () => {
     if (selectedEventId) {
-        let evToDel = events.find(e => e.id === selectedEventId);
+        let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
+        let evToDel = events.find(e => e.id === realId);
         if (evToDel && !canEdit(evToDel)) { alert("You do not have permission to delete this event."); return; }
         
-        events = events.filter(e => e.id !== selectedEventId);
+        events = events.filter(e => e.id !== realId);
         if (evToDel) deleteEventFromCalDAV(evToDel);
         selectedEventId = null;
         render();
@@ -850,8 +1004,75 @@ document.getElementById('btnSavePeopleFilter')?.addEventListener('click', () => 
     checks.forEach(chk => {
         if (chk.checked) visiblePeopleIndices.push(parseInt(chk.value));
     });
+    
+    let myIdx = people.indexOf(currentUser);
+    if (myIdx !== -1 && !visiblePeopleIndices.includes(myIdx)) {
+        visiblePeopleIndices.push(myIdx);
+    }
+    
     saveVisiblePeople();
     document.getElementById('peopleFilterModal').style.display = 'none';
+    render();
+});
+
+document.getElementById('btnCloneForUsers')?.addEventListener('click', () => {
+    if (!selectedEventId) {
+        alert("Please select an event first.");
+        return;
+    }
+    let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
+    let ev = events.find(e => e.id === realId);
+    
+    if (!ev || !canEdit(ev)) {
+        alert("You do not have permission to clone this event.");
+        return;
+    }
+    
+    const list = document.getElementById('cloneUsersList');
+    list.innerHTML = '';
+    people.forEach((p, idx) => {
+        if (!p) return;
+        let div = document.createElement('div');
+        let chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.value = idx;
+        chk.id = 'chk_clone_person_' + idx;
+        
+        let lbl = document.createElement('label');
+        lbl.htmlFor = 'chk_clone_person_' + idx;
+        lbl.innerText = p;
+        
+        div.appendChild(chk);
+        div.appendChild(lbl);
+        list.appendChild(div);
+    });
+    document.getElementById('cloneUsersModal').style.display = 'block';
+});
+
+document.getElementById('btnDoCloneUsers')?.addEventListener('click', () => {
+    let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
+    let ev = events.find(e => e.id === realId);
+    
+    if (!ev) return;
+    
+    let checks = document.querySelectorAll('#cloneUsersList input[type="checkbox"]:checked');
+    if (checks.length === 0) {
+        alert("Please select at least one user.");
+        return;
+    }
+    
+    checks.forEach(chk => {
+        let targetPersonIdx = parseInt(chk.value);
+        let newEv = {
+            ...ev,
+            id: Date.now().toString() + Math.floor(Math.random() * 1000),
+            personIdx: targetPersonIdx
+        };
+        events.push(newEv);
+        putEventToCalDAV(newEv);
+    });
+    
+    document.getElementById('cloneUsersModal').style.display = 'none';
     render();
 });
 
@@ -921,7 +1142,8 @@ document.getElementById('btnPrint')?.addEventListener('click', () => {
         }
     }
 
-    events.forEach(ev => {
+    let displayEvents = typeof unrollEvents === 'function' ? unrollEvents() : events;
+    displayEvents.forEach(ev => {
         let colIdx = -1;
         if (isPeopleView()) { 
             if (ev.date === formatDate(currentDate)) {
@@ -959,12 +1181,20 @@ document.getElementById('btnPrint')?.addEventListener('click', () => {
         }
     });
 
-    doc.save("Calendar_Schedule_Vector.pdf");
+    let pdfName = "Schedule.pdf";
+    if (visiblePeopleIndices.length === 1) {
+        let pName = people[visiblePeopleIndices[0]] || currentUser || "Calendar";
+        pdfName = pName.replace(/[^a-z0-9]/gi, '_') + "_Schedule.pdf";
+    } else if (currentUser) {
+        pdfName = currentUser.replace(/[^a-z0-9]/gi, '_') + "_Schedule.pdf";
+    }
+    doc.save(pdfName);
 });
 
 document.getElementById('btnExport')?.addEventListener('click', () => {
     let content = "========================================\r\n           UPCOMING SCHEDULE            \r\n========================================\r\n\r\n";
-    let sorted = events.filter(e => e.date >= formatDate(new Date())).sort((a,b) => a.date.localeCompare(b.date) || a.startMin - b.startMin);
+    let displayEvents = unrollEvents();
+    let sorted = displayEvents.filter(e => e.date >= formatDate(new Date())).sort((a,b) => a.date.localeCompare(b.date) || a.startMin - b.startMin);
     
     sorted.forEach(e => {
         let p = people[e.personIdx] || "";

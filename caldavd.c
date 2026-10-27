@@ -6,6 +6,7 @@
  * With GCC (MinGW-w64):
  *   g cc -Os -s -Wl,--subsystem,windows -mwindows -o caldavd.exe caldavd.c -lgdi32 -lole32 -limm32 -lcomdlg32 -lcomctl32 -lws2_32 -ladvapi32
  *  gcc -g -O0 -Wl,--subsystem,windows -mwindows -o caldavd.exe caldavd.c -lgdi32 -lole32 -limm32 -lcomdlg32 -lcomctl32 -lws2_32 -ladvapi32 -lsecur32 -lcrypt32
+ *  g cc -O3 -Wl,--subsystem,windows -mwindows -o caldavd.exe caldavd.c -lgdi32 -lole32 -limm32 -lcomdlg32 -lcomctl32 -lws2_32 -ladvapi32 -lsecur32 -lcrypt32
  * 
  * 2026 HUGO
  * 
@@ -87,6 +88,21 @@ static BOOL g_bAnonymous = TRUE;
 static BOOL g_bUseTls = TRUE;
 static UINT g_TaskbarCreatedMsg = 0;
 static WNDPROC OriginalListBoxProc = NULL;
+
+static LRESULT CALLBACK ListBoxSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_KEYDOWN && wp == VK_DELETE) {
+        int idx = (int)SendMessage(hwnd, LB_GETCURSEL, 0, 0);
+        if (idx != LB_ERR) {
+            char user[256];
+            SendMessage(hwnd, LB_GETTEXT, idx, (LPARAM)user);
+            WritePrivateProfileString("users", user, NULL, CONFIG_FILE);
+            WritePrivateProfileString("perms", user, NULL, CONFIG_FILE);
+            SendMessage(hwnd, LB_DELETESTRING, idx, 0);
+        }
+        return 0;
+    }
+    return CallWindowProc(OriginalListBoxProc, hwnd, msg, wp, lp);
+}
 
 static CredHandle g_SrvCreds;
 static BOOL g_TlsInitialized = FALSE;
@@ -306,6 +322,16 @@ VOID CleanupTLS(void) {
     }
 }
 
+VOID PopulateUserList(HWND listbox) {
+    char keys[4096] = {0};
+    SendMessage(listbox, LB_RESETCONTENT, 0, 0);
+    GetPrivateProfileString("users", NULL, "", keys, sizeof(keys), CONFIG_FILE);
+    char* p = keys;
+    while (*p) {
+        SendMessage(listbox, LB_ADDSTRING, 0, (LPARAM)p);
+        p += strlen(p) + 1;
+    }
+}
 BOOL TlsAccept(ClientThreadCtx* ctx) {
     if (!ctx->use_tls) return TRUE;
     
@@ -844,6 +870,63 @@ unsigned __stdcall ClientHandler(void* pParam) {
     return HttpClientHandler(pParam);
 }
 
+unsigned int CalculateEventETag(const char* title, const char* date, int startMin, int duration, const char* rrule) {
+    unsigned int hash = 5381;
+    const char* str = title; while (*str) hash = ((hash << 5) + hash) + *str++;
+    str = date; while (*str) hash = ((hash << 5) + hash) + *str++;
+    str = rrule; if (str) while (*str) hash = ((hash << 5) + hash) + *str++;
+    hash = ((hash << 5) + hash) + startMin;
+    hash = ((hash << 5) + hash) + duration;
+    return hash;
+}
+
+VOID GetCalendarCTag(char* outCtag, int maxLen) {
+    WIN32_FIND_DATA fd;
+    char searchPath[MAX_PATH];
+    snprintf(searchPath, sizeof(searchPath), "%s\\*.json", DATA_DIR);
+    HANDLE hFind = FindFirstFile(searchPath, &fd);
+    
+    FILETIME maxTime = {0};
+    
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (CompareFileTime(&fd.ftLastWriteTime, &maxTime) > 0) {
+                maxTime = fd.ftLastWriteTime;
+            }
+        } while (FindNextFile(hFind, &fd));
+        FindClose(hFind);
+    }
+    snprintf(outCtag, maxLen, "%lu-%lu", maxTime.dwHighDateTime, maxTime.dwLowDateTime);
+}
+
+int GetUserPersonIdx(const char* username) {
+    if (!username || !username[0]) return 0;
+    int idx = 0, curr = 0;
+    char filepath[MAX_PATH];
+    snprintf(filepath, sizeof(filepath), "%s/people.json", DATA_DIR);
+    FILE* fp = fopen(filepath, "rb");
+    if (fp) {
+        char buf[4096];
+        size_t bytes = fread(buf, 1, sizeof(buf)-1, fp);
+        buf[bytes] = '\0';
+        
+        char searchStr[256];
+        snprintf(searchStr, sizeof(searchStr), "\"%s\"", username);
+        char* p = buf;
+        
+        while (*p) {
+            if (*p == '"') {
+                if (strncmp(p, searchStr, strlen(searchStr)) == 0) { idx = curr; break; }
+                p++; while (*p && *p != '"') p++;
+                curr++;
+            }
+            if (*p) p++;
+        }
+        fclose(fp);
+    }
+    return idx;
+}
+
 VOID HandleCommandLine(ClientThreadCtx* ctx, char* buffer, char* response, const char* authUser) {
     char method[16] = {0};
     char path[MAX_PATH] = {0};
@@ -864,39 +947,163 @@ VOID HandleCommandLine(ClientThreadCtx* ctx, char* buffer, char* response, const
     if (clPtr) contentLen = atoi(clPtr + 15);
 
     if (strcmp(method, "OPTIONS") == 0) {
-        // Advertise WebDAV and CalDAV support to the connecting client
         SendHTTPResponse(ctx, "200 OK", "text/plain", "", 0, 
-            "DAV: 1, 2, 3, calendar-access, addressbook\r\n"
+            "DAV: 1, 2, 3, calendar-access\r\n"
             "Allow: OPTIONS, GET, HEAD, POST, PUT, DELETE, TRACE, COPY, MOVE, PROPFIND, PROPPATCH, REPORT\r\n");
     }
     else if (strcmp(method, "PROPFIND") == 0) {
         char xmlResponse[4096];
         
-        // Provide a 207 Multi-Status XML mapping the user principal and calendar home
-        snprintf(xmlResponse, sizeof(xmlResponse),
-            "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n"
-            "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n"
-            "  <D:response>\n"
-            "    <D:href>%s</D:href>\n"
-            "    <D:propstat>\n"
-            "      <D:prop>\n"
-            "        <D:resourcetype><D:collection/></D:resourcetype>\n"
-            "        <D:displayname>CalDAV-D Server</D:displayname>\n"
-            "        <D:current-user-principal><D:href>/principal/%s/</D:href></D:current-user-principal>\n"
-            "        <C:calendar-home-set><D:href>/calendar/</D:href></C:calendar-home-set>\n"
-            "        <CARD:addressbook-home-set><D:href>/contacts/</D:href></CARD:addressbook-home-set>\n"
-            "      </D:prop>\n"
-            "      <D:status>HTTP/1.1 200 OK</D:status>\n"
-            "    </D:propstat>\n"
-            "  </D:response>\n"
-            "</D:multistatus>\n", 
-            path, 
-            (authUser && authUser[0]) ? authUser : "anonymous");
+        if (strncmp(path, "/principal/", 11) == 0) {
+            snprintf(xmlResponse, sizeof(xmlResponse),
+                "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n"
+                "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n"
+                "  <D:response>\n"
+                "    <D:href>%s</D:href>\n"
+                "    <D:propstat>\n"
+                "      <D:prop>\n"
+                "        <D:resourcetype><D:principal/></D:resourcetype>\n"
+                "        <D:displayname>%s</D:displayname>\n"
+                "        <C:calendar-home-set><D:href>/calendar/</D:href></C:calendar-home-set>\n"
+                "      </D:prop>\n"
+                "      <D:status>HTTP/1.1 200 OK</D:status>\n"
+                "    </D:propstat>\n"
+                "  </D:response>\n"
+                "</D:multistatus>\n",
+                path, (authUser && authUser[0]) ? authUser : "anonymous");
+        } else {
+            char ctag[64] = {0}, calName[128] = "CalDAV-D Server", calColor[32] = "#039BE5";
+            GetCalendarCTag(ctag, sizeof(ctag));
+            GetPrivateProfileString("calendar_props", "displayname", "CalDAV-D Server", calName, sizeof(calName), CONFIG_FILE);
+            GetPrivateProfileString("calendar_props", "color", "#039BE5", calColor, sizeof(calColor), CONFIG_FILE);
+            
+            snprintf(xmlResponse, sizeof(xmlResponse),
+                "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n"
+                "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CS=\"http://calendarserver.org/ns/\" xmlns:ICAL=\"http://apple.com/ns/ical/\">\n"
+                "  <D:response>\n"
+                "    <D:href>%s</D:href>\n"
+                "    <D:propstat>\n"
+                "      <D:prop>\n"
+                "        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n"
+                "        <D:displayname>%s</D:displayname>\n"
+                "        <ICAL:calendar-color>%s</ICAL:calendar-color>\n"
+                "        <CS:getctag>\"%s\"</CS:getctag>\n"
+                "        <D:current-user-principal><D:href>/principal/%s/</D:href></D:current-user-principal>\n"
+                "        <C:calendar-home-set><D:href>/calendar/</D:href></C:calendar-home-set>\n"
+                "      </D:prop>\n"
+                "      <D:status>HTTP/1.1 200 OK</D:status>\n"
+                "    </D:propstat>\n"
+                "  </D:response>\n"
+                "</D:multistatus>\n", 
+                path, calName, calColor, ctag, (authUser && authUser[0]) ? authUser : "anonymous");
+        }
 
         SendHTTPResponse(ctx, "207 Multi-Status", "application/xml; charset=utf-8", xmlResponse, strlen(xmlResponse), NULL);
     }
-else if (strcmp(method, "REPORT") == 0) {
-        // Allocate a 1MB buffer for the XML response
+    else if (strcmp(method, "PROPPATCH") == 0) {
+        char color[32] = {0}, name[128] = {0};
+        char* pColor = strstr(body, "<calendar-color");
+        if (!pColor) pColor = strstr(body, "<ICAL:calendar-color");
+        if (pColor) {
+            pColor = strchr(pColor, '>');
+            if (pColor) {
+                sscanf(pColor + 1, "%31[^<]", color);
+                WritePrivateProfileString("calendar_props", "color", color, CONFIG_FILE);
+            }
+        }
+        
+        char* pName = strstr(body, "<D:displayname>");
+        if (pName) {
+            sscanf(pName + 15, "%127[^<]", name);
+            WritePrivateProfileString("calendar_props", "displayname", name, CONFIG_FILE);
+        }
+
+        char xmlResponse[1024];
+        snprintf(xmlResponse, sizeof(xmlResponse),
+            "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n"
+            "<D:multistatus xmlns:D=\"DAV:\">\n"
+            "  <D:response>\n"
+            "    <D:href>%s</D:href>\n"
+            "    <D:propstat>\n"
+            "      <D:prop><D:displayname/><calendar-color xmlns=\"http://apple.com/ns/ical/\"/></D:prop>\n"
+            "      <D:status>HTTP/1.1 200 OK</D:status>\n"
+            "    </D:propstat>\n"
+            "  </D:response>\n"
+            "</D:multistatus>\n", path);
+        SendHTTPResponse(ctx, "207 Multi-Status", "application/xml; charset=utf-8", xmlResponse, strlen(xmlResponse), NULL);
+    }
+    else if (strcmp(method, "REPORT") == 0) {
+        char currentCtag[64] = {0};
+        GetCalendarCTag(currentCtag, sizeof(currentCtag));
+        char currentToken[128];
+        snprintf(currentToken, sizeof(currentToken), "http://caldavd/sync/%s", currentCtag);
+
+        char clientToken[128] = {0};
+        BOOL isSyncReport = body && strstr(body, "sync-collection") != NULL;
+        BOOL isMultiget = body && (strstr(body, ":calendar-multiget") != NULL || strstr(body, "<calendar-multiget") != NULL);
+        
+        if (isSyncReport) {
+            char* pToken = strstr(body, "sync-token>");
+            if (pToken) {
+                char* pEnd = strchr(pToken + 11, '<');
+                if (pEnd) {
+                    int len = pEnd - (pToken + 11);
+                    if (len > 0 && len < 127) {
+                        strncpy(clientToken, pToken + 11, len);
+                        clientToken[len] = '\0';
+                    }
+                }
+            }
+            
+            if (clientToken[0] != '\0') {
+                if (strcmp(clientToken, currentToken) == 0) {
+                    char xmlResponse[1024];
+                    snprintf(xmlResponse, sizeof(xmlResponse),
+                        "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n"
+                        "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n"
+                        "  <D:sync-token>%s</D:sync-token>\n"
+                        "</D:multistatus>\n", currentToken);
+                    SendHTTPResponse(ctx, "207 Multi-Status", "application/xml; charset=utf-8", xmlResponse, strlen(xmlResponse), NULL);
+                    return;
+                } else {
+                    const char* errResp = 
+                        "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n"
+                        "<D:error xmlns:D=\"DAV:\">\n"
+                        "  <D:valid-sync-token/>\n"
+                        "</D:error>\n";
+                    SendHTTPResponse(ctx, "403 Forbidden", "application/xml; charset=utf-8", errResp, strlen(errResp), NULL);
+                    return;
+                }
+            }
+        }
+
+        char requestedUids[4096] = "|";
+        if (isMultiget && body) {
+            char* href = body;
+            char* hrefTag = strstr(href, "href>");
+            while (hrefTag != NULL) {
+                href = hrefTag + 5;
+                char* endHref = strchr(href, '<');
+                if (endHref) {
+                    char hrefBuf[256] = {0};
+                    int len = endHref - href;
+                    if (len < 255) {
+                        strncpy(hrefBuf, href, len);
+                        char uid[128] = {0};
+                        char* lastSlash = strrchr(hrefBuf, '/');
+                        if (lastSlash) sscanf(lastSlash + 1, "%127[^.]", uid);
+                        else sscanf(hrefBuf, "%127[^.]", uid);
+                        
+                        if (uid[0] != '\0' && strlen(requestedUids) + strlen(uid) + 2 < sizeof(requestedUids)) {
+                            strcat(requestedUids, uid);
+                            strcat(requestedUids, "|");
+                        }
+                    }
+                }
+                hrefTag = strstr(href, "href>");
+            }
+        }
+
         char* xmlResponse = (char*)malloc(1024 * 1024);
         if (!xmlResponse) {
             SendHTTPResponse(ctx, "500 Internal Error", "text/plain", "Memory Error", 12, NULL);
@@ -918,23 +1125,28 @@ else if (strcmp(method, "REPORT") == 0) {
                 snprintf(filepath, sizeof(filepath), "%s/%s", DATA_DIR, fd.cFileName);
                 FILE* fp = fopen(filepath, "rb");
                 if (fp) {
-                    fseek(fp, 0, SEEK_END);
-                    long size = ftell(fp);
-                    fseek(fp, 0, SEEK_SET);
+                    fseek(fp, 0, SEEK_END); long size = ftell(fp); fseek(fp, 0, SEEK_SET);
                     
                     char* fileBuf = malloc(size + 1);
                     if (fileBuf) {
-                        fread(fileBuf, 1, size, fp);
-                        fileBuf[size] = '\0';
+                        fread(fileBuf, 1, size, fp); fileBuf[size] = '\0';
                         
-                        // Parse JSON fields linearly to avoid external dependencies
                         char* eventStart = fileBuf;
                         while ((eventStart = strstr(eventStart, "{\"id\":")) != NULL) {
-                            char id[64] = {0}, title[128] = "Untitled Event", date[16] = {0};
+                            char id[64] = {0}, title[128] = "Untitled Event", date[16] = {0}, rrule[256] = {0};
                             int startMin = 0, duration = 60;
                             
                             char* pId = strstr(eventStart, "\"id\":\"");
                             if (pId) sscanf(pId + 6, "%63[^\"]", id);
+
+                            if (isMultiget) {
+                                char searchUid[130];
+                                snprintf(searchUid, sizeof(searchUid), "|%s|", id);
+                                if (strstr(requestedUids, searchUid) == NULL) {
+                                    eventStart++;
+                                    continue;
+                                }
+                            }
                             
                             char* pTitle = strstr(eventStart, "\"title\":\"");
                             if (pTitle) sscanf(pTitle + 9, "%127[^\"]", title);
@@ -948,7 +1160,11 @@ else if (strcmp(method, "REPORT") == 0) {
                             char* pDur = strstr(eventStart, "\"duration\":");
                             if (pDur) sscanf(pDur + 11, "%d", &duration);
                             
-                            // Convert YYYY/MM/DD to YYYYMMDD
+                            char* pRrule = strstr(eventStart, "\"rrule\":\"");
+                            if (pRrule) sscanf(pRrule + 9, "%255[^\"]", rrule);
+                            
+                            unsigned int etagHash = CalculateEventETag(title, date, startMin, duration, rrule);
+                            
                             char icsDate[9] = {0};
                             if (strlen(date) >= 10) {
                                 icsDate[0] = date[0]; icsDate[1] = date[1]; icsDate[2] = date[2]; icsDate[3] = date[3];
@@ -962,25 +1178,26 @@ else if (strcmp(method, "REPORT") == 0) {
                             int endH = endMin / 60;
                             int endM = endMin % 60;
                             
+                            char rruleBlock[300] = {0};
+                            if (rrule[0]) snprintf(rruleBlock, sizeof(rruleBlock), "RRULE:%s\r\n", rrule);
+                            
                             char eventBuf[2048];
                             snprintf(eventBuf, sizeof(eventBuf),
                                 "  <D:response>\n"
                                 "    <D:href>/calendar/%s.ics</D:href>\n"
                                 "    <D:propstat>\n"
                                 "      <D:prop>\n"
-                                "        <D:getetag>\"%s\"</D:getetag>\n"
-                                "        <C:calendar-data><![CDATA[BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalDAV-D//EN\r\nBEGIN:VEVENT\r\nUID:%s\r\nDTSTAMP:%sT%02d%02d00Z\r\nDTSTART:%sT%02d%02d00Z\r\nDTEND:%sT%02d%02d00Z\r\nSUMMARY:%s\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n]]></C:calendar-data>\n"
+                                "        <D:getetag>\"%s-%x\"</D:getetag>\n"
+                                "        <C:calendar-data><![CDATA[BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalDAV-D//EN\r\nBEGIN:VEVENT\r\nUID:%s\r\nDTSTAMP:%sT%02d%02d00\r\nDTSTART:%sT%02d%02d00\r\nDTEND:%sT%02d%02d00\r\n%sSUMMARY:%s\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n]]></C:calendar-data>\n"
                                 "      </D:prop>\n"
                                 "      <D:status>HTTP/1.1 200 OK</D:status>\n"
                                 "    </D:propstat>\n"
                                 "  </D:response>\n",
-                                id, id, id, icsDate, startH, startM, icsDate, startH, startM, icsDate, endH, endM, title);
+                                id, id, etagHash, id, icsDate, startH, startM, icsDate, startH, startM, icsDate, endH, endM, rruleBlock, title);
                                 
-                            // Append if we have capacity
-                            if (strlen(xmlResponse) + strlen(eventBuf) < 1024 * 1024 - 100) {
+                            if (strlen(xmlResponse) + strlen(eventBuf) < 1024 * 1024 - 500) {
                                 strcat(xmlResponse, eventBuf);
                             }
-                            
                             eventStart++;
                         }
                         free(fileBuf);
@@ -989,6 +1206,12 @@ else if (strcmp(method, "REPORT") == 0) {
                 }
             } while (FindNextFile(hFind, &fd));
             FindClose(hFind);
+        }
+        
+        if (isSyncReport) {
+            char tokenBlock[256];
+            snprintf(tokenBlock, sizeof(tokenBlock), "  <D:sync-token>%s</D:sync-token>\n", currentToken);
+            strcat(xmlResponse, tokenBlock);
         }
         
         strcat(xmlResponse, "</D:multistatus>\n");
@@ -1066,7 +1289,55 @@ else if (strcmp(method, "REPORT") == 0) {
         else { SendHTTPResponse(ctx, "404 Not Found", "text/plain", "Endpoint not found", 18, NULL); }
     }
     else if (strcmp(method, "PUT") == 0) {
-        if (strcmp(path, "/api/prefs") == 0) {
+        if (strcmp(path, "/api/user") == 0) {
+            if (body && contentLen > 0) {
+                char* safeBody = malloc(contentLen + 1);
+                memcpy(safeBody, body, contentLen);
+                safeBody[contentLen] = '\0';
+                
+                char oldName[128] = {0}, newName[128] = {0};
+                char* pipe = strchr(safeBody, '|');
+                if (pipe) {
+                    *pipe = '\0';
+                    strncpy(oldName, safeBody, 127);
+                    strncpy(newName, pipe + 1, 127);
+                } else {
+                    strncpy(newName, safeBody, 127);
+                }
+                free(safeBody);
+                
+                if (newName[0]) {
+                    char existingUser[256] = {0};
+                    if (oldName[0]) {
+                        GetPrivateProfileString("users", oldName, "", existingUser, sizeof(existingUser), CONFIG_FILE);
+                    }
+                    
+                    if (existingUser[0]) {
+                        WritePrivateProfileString("users", newName, existingUser, CONFIG_FILE);
+                        if (strcmp(oldName, newName) != 0) {
+                            WritePrivateProfileString("users", oldName, NULL, CONFIG_FILE);
+                            char perms[8] = "0";
+                            GetPrivateProfileString("perms", oldName, "0", perms, sizeof(perms), CONFIG_FILE);
+                            WritePrivateProfileString("perms", newName, perms, CONFIG_FILE);
+                            WritePrivateProfileString("perms", oldName, NULL, CONFIG_FILE);
+                        }
+                    } else {
+                        char hash[65], entry[128];
+                        GenerateSaltedHash("password123", "salt2026", hash);
+                        snprintf(entry, sizeof(entry), "salt2026,%s", hash);
+                        WritePrivateProfileString("users", newName, entry, CONFIG_FILE);
+                        WritePrivateProfileString("perms", newName, "0", CONFIG_FILE);
+                    }
+                    if (g_hSettingsWnd) {
+                        HWND hList = GetProp(g_hSettingsWnd, "ListUsers");
+                        if (hList) PopulateUserList(hList);
+                    }
+                }
+            }
+            SendHTTPResponse(ctx, "200 OK", "text/plain", "Saved", 5, NULL);
+            return;
+        }
+        else if (strcmp(path, "/api/prefs") == 0) {
             if (body && contentLen > 0) {
                 char* safeBody = malloc(contentLen + 1);
                 memcpy(safeBody, body, contentLen);
@@ -1082,78 +1353,215 @@ else if (strcmp(method, "REPORT") == 0) {
             return;
         }
         else if (strncmp(path, "/calendar/", 10) == 0) {
-            char filepath[MAX_PATH];
-            snprintf(filepath, sizeof(filepath), "%s/%s", DATA_DIR, path + 10);
-            if (body) {
-                FILE* fp = fopen(filepath, "wb");
-                if (fp) {
-                    int bodyRead = strlen(body);
-                    fwrite(body, 1, bodyRead, fp);
-                    
-                    int remaining = contentLen - bodyRead;
-                    while (remaining > 0) {
-                        char chunk[4096];
-                        int r = TlsRecv(ctx, chunk, sizeof(chunk));
-                        if (r <= 0) break;
-                        fwrite(chunk, 1, r, fp);
-                        remaining -= r;
+            if (strstr(path, ".ics") != NULL) {
+                if (!body || contentLen <= 0) { SendHTTPResponse(ctx, "400 Bad Request", "text/plain", "No Body", 7, NULL); return; }
+                
+                char uid[128] = {0}, summary[256] = "New Event", dtstart[64] = {0}, dtend[64] = {0}, rrule[256] = {0};
+                sscanf(path + 10, "%127[^.]", uid);
+                
+                char* p = strstr(body, "SUMMARY:");
+                if (p) sscanf(p + 8, "%255[^\r\n]", summary);
+                
+                p = strstr(body, "DTSTART");
+                if (p) { 
+                    char *colon = strchr(p, ':');
+                    char *newline = strchr(p, '\n');
+                    if (colon && (!newline || colon < newline)) {
+                        sscanf(colon + 1, "%63[^\r\n]", dtstart); 
                     }
-                    
-                    fclose(fp);
-                    SendHTTPResponse(ctx, "201 Created", "text/plain", "Created", 7, NULL);
-                } else { SendHTTPResponse(ctx, "500 Internal Error", "text/plain", "I/O Error", 9, NULL); }
-            } else { SendHTTPResponse(ctx, "400 Bad Request", "text/plain", "No Body", 7, NULL); }
+                }
+                
+                p = strstr(body, "DTEND");
+                if (p) { 
+                    char *colon = strchr(p, ':');
+                    char *newline = strchr(p, '\n');
+                    if (colon && (!newline || colon < newline)) {
+                        sscanf(colon + 1, "%63[^\r\n]", dtend); 
+                    }
+                }
+                
+                char* pRruleIn = strstr(body, "RRULE:");
+                if (pRruleIn) sscanf(pRruleIn + 6, "%255[^\r\n]", rrule);
+                
+                int y=2026, m=10, d=26, h=12, min=0;
+                if (strlen(dtstart) >= 15) {
+                    sscanf(dtstart, "%4d%2d%2dT%2d%2d", &y, &m, &d, &h, &min);
+                } else if (strlen(dtstart) >= 8) {
+                    sscanf(dtstart, "%4d%2d%2d", &y, &m, &d);
+                }
+                int startMin = h * 60 + min;
+                
+                int ey=y, em=m, ed=d, eh=h+1, emin=min;
+                if (strlen(dtend) >= 15) {
+                    sscanf(dtend, "%4d%2d%2dT%2d%2d", &ey, &em, &ed, &eh, &emin);
+                } else if (strlen(dtend) >= 8) {
+                    sscanf(dtend, "%4d%2d%2d", &ey, &em, &ed);
+                }
+                
+                int duration = (eh * 60 + emin) - startMin;
+                if (duration <= 0) duration = 60;
+                
+                char dateStr[16]; snprintf(dateStr, sizeof(dateStr), "%04d/%02d/%02d", y, m, d);
+                int quarter = ((m - 1) / 3) + 1;
+                char filepath[MAX_PATH]; snprintf(filepath, sizeof(filepath), "%s/%04d-Q%d.json", DATA_DIR, y, quarter);
+                
+                int assignedIdx = GetUserPersonIdx(authUser);
+                unsigned int etagHash = CalculateEventETag(summary, dateStr, startMin, duration, rrule);
+                
+                char newJson[1024];
+                snprintf(newJson, sizeof(newJson), "{\"id\":\"%s\",\"title\":\"%s\",\"startMin\":%d,\"duration\":%d,\"color\":\"#039BE5\",\"date\":\"%s\",\"personIdx\":%d%s%s%s}", 
+                    uid, summary, startMin, duration, dateStr, assignedIdx,
+                    rrule[0] ? ",\"rrule\":\"" : "", rrule[0] ? rrule : "", rrule[0] ? "\"" : "");
+                
+                FILE* fp = fopen(filepath, "rb");
+                char* fileBuf = NULL; long size = 0;
+                if (fp) {
+                    fseek(fp, 0, SEEK_END); size = ftell(fp); fseek(fp, 0, SEEK_SET);
+                    fileBuf = malloc(size + 1); if (fileBuf) { fread(fileBuf, 1, size, fp); fileBuf[size] = '\0'; } fclose(fp);
+                }
+                
+                char* outBuf = malloc((size > 0 ? size : 10) + 2048);
+                strcpy(outBuf, "[");
+                int first = 1;
+                if (fileBuf) {
+                    char* eventStart = fileBuf;
+                    while ((eventStart = strstr(eventStart, "{\"id\":")) != NULL) {
+                        char currentId[128] = {0};
+                        char* pId = strstr(eventStart, "\"id\":\"");
+                        if (pId) sscanf(pId + 6, "%63[^\"]", currentId);
+                        
+                        char* nextObj = strstr(eventStart + 1, "{\"id\":");
+                        if (strcmp(currentId, uid) != 0) {
+                            if (!first) strcat(outBuf, ",");
+                            int copyLen = nextObj ? (int)(nextObj - eventStart) : (int)strlen(eventStart);
+                            while (copyLen > 0 && (eventStart[copyLen-1] == ']' || eventStart[copyLen-1] == ',' || eventStart[copyLen-1] == ' ' || eventStart[copyLen-1] == '\r' || eventStart[copyLen-1] == '\n')) {
+                                copyLen--;
+                            }
+                            if (copyLen > 0) {
+                                size_t currLen = strlen(outBuf);
+                                memcpy(outBuf + currLen, eventStart, copyLen);
+                                outBuf[currLen + copyLen] = '\0';
+                            }
+                            first = 0;
+                        }
+                        if (!nextObj) break;
+                        eventStart = nextObj;
+                    }
+                    free(fileBuf);
+                }
+                
+                if (!first) strcat(outBuf, ",");
+                strcat(outBuf, newJson);
+                strcat(outBuf, "]");
+                
+                fp = fopen(filepath, "wb");
+                if (fp) { fwrite(outBuf, 1, strlen(outBuf), fp); fclose(fp); }
+                free(outBuf);
+                
+                char header[256];
+                snprintf(header, sizeof(header), "ETag: \"%s-%x\"\r\n", uid, etagHash);
+                SendHTTPResponse(ctx, "201 Created", "text/plain", "", 0, header);
+            }
+            else {
+                char filepath[MAX_PATH];
+                snprintf(filepath, sizeof(filepath), "%s/%s", DATA_DIR, path + 10);
+                if (body) {
+                    FILE* fp = fopen(filepath, "wb");
+                    if (fp) {
+                        int bodyRead = strlen(body);
+                        fwrite(body, 1, bodyRead, fp);
+                        
+                        int remaining = contentLen - bodyRead;
+                        while (remaining > 0) {
+                            char chunk[4096];
+                            int r = TlsRecv(ctx, chunk, sizeof(chunk));
+                            if (r <= 0) break;
+                            fwrite(chunk, 1, r, fp);
+                            remaining -= r;
+                        }
+                        
+                        fclose(fp);
+                        SendHTTPResponse(ctx, "201 Created", "text/plain", "Created", 7, NULL);
+                    } else { SendHTTPResponse(ctx, "500 Internal Error", "text/plain", "I/O Error", 9, NULL); }
+                } else { SendHTTPResponse(ctx, "400 Bad Request", "text/plain", "No Body", 7, NULL); }
+            }
         }
     }
     else if (strcmp(method, "DELETE") == 0 && strncmp(path, "/calendar/", 10) == 0) {
-        char filepath[MAX_PATH];
-        snprintf(filepath, sizeof(filepath), "%s/%s", DATA_DIR, path + 10);
-        remove(filepath);
-        SendHTTPResponse(ctx, "204 No Content", "text/plain", "", 0, NULL);
-    }
-}
-
-VOID PopulateUserList(HWND listbox) {
-    char keys[4096] = {0};
-    SendMessage(listbox, LB_RESETCONTENT, 0, 0);
-    GetPrivateProfileString("users", NULL, "", keys, sizeof(keys), CONFIG_FILE);
-    char* p = keys;
-    while (*p) {
-        SendMessage(listbox, LB_ADDSTRING, 0, (LPARAM)p);
-        p += strlen(p) + 1;
-    }
-}
-
-static LRESULT CALLBACK ListBoxSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_KEYDOWN && wp == VK_DELETE) {
-        int idx = (int)SendMessage(hwnd, LB_GETCURSEL, 0, 0);
-        if (idx != LB_ERR) {
-            char user[256];
-            SendMessage(hwnd, LB_GETTEXT, idx, (LPARAM)user);
-            WritePrivateProfileString("users", user, NULL, CONFIG_FILE);
-            WritePrivateProfileString("perms", user, NULL, CONFIG_FILE);
-            SendMessage(hwnd, LB_DELETESTRING, idx, 0);
+        if (strstr(path, ".ics") != NULL) {
+            char uid[128] = {0};
+            sscanf(path + 10, "%127[^.]", uid);
+            
+            WIN32_FIND_DATA fd;
+            char searchPath[MAX_PATH];
+            snprintf(searchPath, sizeof(searchPath), "%s\\*.json", DATA_DIR);
+            HANDLE hFind = FindFirstFile(searchPath, &fd);
+            
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    if (strcmp(fd.cFileName, "people.json") == 0) continue;
+                    
+                    char filepath[MAX_PATH];
+                    snprintf(filepath, sizeof(filepath), "%s/%s", DATA_DIR, fd.cFileName);
+                    FILE* fp = fopen(filepath, "rb");
+                    if (fp) {
+                        fseek(fp, 0, SEEK_END); long size = ftell(fp); fseek(fp, 0, SEEK_SET);
+                        char* fileBuf = malloc(size + 1);
+                        if (fileBuf) {
+                            fread(fileBuf, 1, size, fp); fileBuf[size] = '\0';
+                            
+                            char* outBuf = malloc(size + 1024);
+                            strcpy(outBuf, "[");
+                            int first = 1;
+                            int modified = 0;
+                            
+                            char* eventStart = fileBuf;
+                            while ((eventStart = strstr(eventStart, "{\"id\":")) != NULL) {
+                                char currentId[128] = {0};
+                                char* pId = strstr(eventStart, "\"id\":\"");
+                                if (pId) sscanf(pId + 6, "%63[^\"]", currentId);
+                                
+                                char* nextObj = strstr(eventStart + 1, "{\"id\":");
+                                if (strcmp(currentId, uid) != 0) {
+                                    if (!first) strcat(outBuf, ",");
+                                    int copyLen = nextObj ? (int)(nextObj - eventStart) : (int)strlen(eventStart);
+                                    while (copyLen > 0 && (eventStart[copyLen-1] == ']' || eventStart[copyLen-1] == ',' || eventStart[copyLen-1] == ' ' || eventStart[copyLen-1] == '\r' || eventStart[copyLen-1] == '\n')) {
+                                        copyLen--;
+                                    }
+                                    if (copyLen > 0) {
+                                        size_t currLen = strlen(outBuf);
+                                        memcpy(outBuf + currLen, eventStart, copyLen);
+                                        outBuf[currLen + copyLen] = '\0';
+                                    }
+                                    first = 0;
+                                } else { modified = 1; }
+                                
+                                if (!nextObj) break;
+                                eventStart = nextObj;
+                            }
+                            strcat(outBuf, "]");
+                            fclose(fp);
+                            
+                            if (modified) {
+                                fp = fopen(filepath, "wb");
+                                if (fp) { fwrite(outBuf, 1, strlen(outBuf), fp); fclose(fp); }
+                            }
+                            free(outBuf);
+                            free(fileBuf);
+                        } else { fclose(fp); }
+                    }
+                } while (FindNextFile(hFind, &fd));
+                FindClose(hFind);
+            }
+            SendHTTPResponse(ctx, "204 No Content", "text/plain", "", 0, NULL);
+        } else {
+            char filepath[MAX_PATH];
+            snprintf(filepath, sizeof(filepath), "%s/%s", DATA_DIR, path + 10);
+            remove(filepath);
+            SendHTTPResponse(ctx, "204 No Content", "text/plain", "", 0, NULL);
         }
-        return 0;
     }
-    return CallWindowProc(OriginalListBoxProc, hwnd, msg, wp, lp);
 }
-
-INT_PTR CreateSettingsWindow(void) {
-    WNDCLASSEX wc = {0};
-    wc.cbSize = sizeof(WNDCLASSEX);
-    wc.lpfnWndProc = SettingsWndProc;
-    wc.hInstance = g_hInstance;
-    wc.lpszClassName = "CaldAVDSettingsClass";
-    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    RegisterClassEx(&wc);
-    g_hSettingsWnd = CreateWindowEx(0, "CaldAVDSettingsClass", "CalDAV TLS Settings", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 350, 420, NULL, NULL, g_hInstance, NULL);
-    if (g_hSettingsWnd) ShowWindow(g_hSettingsWnd, SW_SHOWNORMAL);
-    return (INT_PTR)g_hSettingsWnd;
-}
-
 LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
@@ -1171,7 +1579,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             CreateWindow("BUTTON", "Stop", WS_CHILD | WS_VISIBLE, 220, 46, 80, 27, hWnd, (HMENU)ID_BTN_STOP, g_hInstance, NULL);
             CreateWindow("BUTTON", "Trust Cert", WS_CHILD | WS_VISIBLE, 220, 76, 80, 27, hWnd, (HMENU)ID_BTN_INSTALL_CERT, g_hInstance, NULL);
             CreateWindow("BUTTON", "Export Cert", WS_CHILD | WS_VISIBLE, 220, 106, 80, 27, hWnd, (HMENU)ID_BTN_EXPORT_CERT, g_hInstance, NULL);
-            CreateWindow("BUTTON", "Manage Certs", WS_CHILD | WS_VISIBLE, 220, 136, 80, 27, hWnd, (HMENU)ID_BTN_CERTMGR, g_hInstance, NULL);
+            CreateWindow("BUTTON", "Manage Cer", WS_CHILD | WS_VISIBLE, 220, 136, 80, 27, hWnd, (HMENU)ID_BTN_CERTMGR, g_hInstance, NULL);
             
             CreateWindow("STATIC", "Users (Select and press Del):", WS_CHILD | WS_VISIBLE | SS_LEFT, 20, 160, 200, 20, hWnd, NULL, g_hInstance, NULL);
             HWND hListUsers = CreateWindowEx(WS_EX_CLIENTEDGE, "LISTBOX", NULL, WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL | WS_BORDER, 20, 180, 120, 180, hWnd, (HMENU)ID_LIST_USERS, g_hInstance, NULL);
@@ -1186,7 +1594,8 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             
             HWND hChkEditAll = CreateWindow("BUTTON", "Can edit all events", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 160, 285, 140, 20, hWnd, (HMENU)ID_CHK_EDITALL, g_hInstance, NULL);
             
-            CreateWindow("BUTTON", "Save User", WS_CHILD | WS_VISIBLE, 160, 320, 140, 30, hWnd, (HMENU)ID_BTN_ADDUSER, g_hInstance, NULL);
+            CreateWindow("BUTTON", "Save User", WS_CHILD | WS_VISIBLE, 160, 320, 70, 30, hWnd, (HMENU)ID_BTN_ADDUSER, g_hInstance, NULL);
+            CreateWindow("BUTTON", "Reset Pw", WS_CHILD | WS_VISIBLE, 235, 320, 65, 30, hWnd, (HMENU)23, g_hInstance, NULL); // ID_BTN_RESET_PASS
             
             char valStr[16];
             snprintf(valStr, sizeof(valStr), "%d", g_Port); SetWindowText(hEditPort, valStr);
@@ -1227,6 +1636,35 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 case ID_BTN_CERTMGR:
                     ShellExecute(NULL, "open", "certmgr.msc", NULL, NULL, SW_SHOWNORMAL);
                     return 0;
+                case 23: { // ID_BTN_RESET_PASS
+                    HWND hList = GetProp(hWnd, "ListUsers");
+                    int idx = SendMessage(hList, LB_GETCURSEL, 0, 0);
+                    if (idx != LB_ERR) {
+                        char user[256]; SendMessage(hList, LB_GETTEXT, idx, (LPARAM)user);
+                        char newPass[16];
+                        snprintf(newPass, sizeof(newPass), "%04x%04x", rand() % 0xFFFF, rand() % 0xFFFF);
+                        
+                        char hash[65], entry[128];
+                        GenerateSaltedHash(newPass, "salt2026", hash);
+                        snprintf(entry, sizeof(entry), "salt2026,%s", hash);
+                        WritePrivateProfileString("users", user, entry, CONFIG_FILE);
+                        
+                        if (OpenClipboard(hWnd)) {
+                            EmptyClipboard();
+                            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, strlen(newPass) + 1);
+                            if (hMem) {
+                                memcpy(GlobalLock(hMem), newPass, strlen(newPass) + 1);
+                                GlobalUnlock(hMem);
+                                SetClipboardData(CF_TEXT, hMem);
+                            }
+                            CloseClipboard();
+                            MessageBox(hWnd, "New password copied to clipboard!", SERVER_NAME, MB_ICONINFORMATION);
+                        }
+                    } else {
+                        MessageBox(hWnd, "Please select a user from the list first.", SERVER_NAME, MB_ICONERROR);
+                    }
+                    return 0;
+                }
                 case ID_BTN_INSTALL_CERT: {
                     PCCERT_CONTEXT pCert = GenerateCertificate();
                     if (pCert) {
@@ -1396,6 +1834,21 @@ VOID CALLBACK UpdateTimerCallback(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD 
     }
 }
 
+INT_PTR CreateSettingsWindow(void) {
+    WNDCLASSEX wc = {0};
+    wc.cbSize = sizeof(WNDCLASSEX);
+    wc.lpfnWndProc = SettingsWndProc;
+    wc.hInstance = g_hInstance;
+    wc.lpszClassName = "CaldAVDSettingsClass";
+    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    RegisterClassEx(&wc);
+    g_hSettingsWnd = CreateWindowEx(0, "CaldAVDSettingsClass", "CalDAV TLS Settings", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 350, 420, NULL, NULL, g_hInstance, NULL);
+    if (g_hSettingsWnd) ShowWindow(g_hSettingsWnd, SW_SHOWNORMAL);
+    return (INT_PTR)g_hSettingsWnd;
+}
+
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: g_TaskbarCreatedMsg = RegisterWindowMessage("TaskbarCreated"); break;
@@ -1422,37 +1875,131 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     char szFile[MAX_PATH] = {0};
                     ofn.lStructSize = sizeof(ofn);
                     ofn.hwndOwner = hWnd;
-                    ofn.lpstrFilter = "JSON Files (*.json)\0*.json\0All Files (*.*)\0*.*\0";
+                    ofn.lpstrFilter = "iCalendar Files (*.ics)\0*.ics\0All Files (*.*)\0*.*\0";
                     ofn.lpstrFile = szFile;
                     ofn.nMaxFile = MAX_PATH;
                     ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
                     if (GetOpenFileNameA(&ofn)) {
-                        char dest[MAX_PATH];
-                        snprintf(dest, sizeof(dest), "%s\\imported_%u.json", DATA_DIR, GetTickCount());
-                        CopyFileA(szFile, dest, FALSE);
-                        MessageBoxA(hWnd, "Calendar imported successfully. The web client will format it into quarters upon next save.", SERVER_NAME, MB_ICONINFORMATION);
+                        FILE* fIn = fopen(szFile, "rb");
+                        if (fIn) {
+                            fseek(fIn, 0, SEEK_END);
+                            long size = ftell(fIn);
+                            fseek(fIn, 0, SEEK_SET);
+                            char* icsBuf = malloc(size + 1);
+                            if (icsBuf) {
+                                fread(icsBuf, 1, size, fIn);
+                                icsBuf[size] = '\0';
+                                
+                                char* eventStart = icsBuf;
+                                int importedCount = 0;
+                                while ((eventStart = strstr(eventStart, "BEGIN:VEVENT")) != NULL) {
+                                    char uid[128] = {0}, summary[256] = "Imported Event", dtstart[32] = {0}, dtend[32] = {0};
+                                    
+                                    char* p = strstr(eventStart, "UID:");
+                                    if (p) sscanf(p + 4, "%127[^\r\n]", uid);
+                                    else snprintf(uid, sizeof(uid), "imp_%u_%d", GetTickCount(), importedCount);
+                                    
+                                    p = strstr(eventStart, "SUMMARY:");
+                                    if (p) sscanf(p + 8, "%255[^\r\n]", summary);
+                                    
+                                    p = strstr(eventStart, "DTSTART");
+                                    if (p) { p = strchr(p, ':'); if (p) sscanf(p + 1, "%31[^\r\n]", dtstart); }
+                                    
+                                    p = strstr(eventStart, "DTEND");
+                                    if (p) { p = strchr(p, ':'); if (p) sscanf(p + 1, "%31[^\r\n]", dtend); }
+                                    
+                                    int y=2026, m=1, d=1, h=12, min=0;
+                                    if (strlen(dtstart) >= 8) sscanf(dtstart, "%4d%2d%2dT%2d%2d", &y, &m, &d, &h, &min);
+                                    int startMins = h * 60 + min;
+                                    
+                                    int ey=y, em=m, ed=d, eh=h+1, emin=min;
+                                    if (strlen(dtend) >= 8) sscanf(dtend, "%4d%2d%2dT%2d%2d", &ey, &em, &ed, &eh, &emin);
+                                    int duration = (eh * 60 + emin) - startMins;
+                                    if (duration <= 0) duration = 60;
+                                    
+                                    int quarter = ((m - 1) / 3) + 1;
+                                    char qFile[MAX_PATH]; snprintf(qFile, sizeof(qFile), "%s/%04d-Q%d.json", DATA_DIR, y, quarter);
+                                    
+                                    char newJson[1024];
+                                    snprintf(newJson, sizeof(newJson), "{\"id\":\"%s\",\"title\":\"%s\",\"startMin\":%d,\"duration\":%d,\"color\":\"#33B679\",\"date\":\"%04d/%02d/%02d\",\"personIdx\":0}", uid, summary, startMins, duration, y, m, d);
+                                    
+                                    FILE* fp = fopen(qFile, "rb");
+                                    char* fileBuf = NULL; long fsize = 0;
+                                    if (fp) {
+                                        fseek(fp, 0, SEEK_END); fsize = ftell(fp); fseek(fp, 0, SEEK_SET);
+                                        fileBuf = malloc(fsize + 1); if (fileBuf) { fread(fileBuf, 1, fsize, fp); fileBuf[fsize] = '\0'; } fclose(fp);
+                                    }
+                                    
+                                    char* outBuf = malloc((fsize > 0 ? fsize : 10) + 2048);
+                                    strcpy(outBuf, "[");
+                                    int first = 1;
+                                    if (fileBuf) {
+                                        char* eStart = fileBuf;
+                                        while ((eStart = strstr(eStart, "{\"id\":")) != NULL) {
+                                            char currentId[128] = {0};
+                                            char* pId = strstr(eStart, "\"id\":\"");
+                                            if (pId) sscanf(pId + 6, "%63[^\"]", currentId);
+                                            
+                                            char* nextObj = strstr(eStart + 1, "{\"id\":");
+                                            if (strcmp(currentId, uid) != 0) {
+                                                if (!first) strcat(outBuf, ",");
+                                                size_t copyLen = nextObj ? (size_t)(nextObj - eStart) : strlen(eStart);
+                                                while (copyLen > 0 && (eStart[copyLen-1] == ']' || eStart[copyLen-1] == ',' || eStart[copyLen-1] == ' ' || eStart[copyLen-1] == '\r' || eStart[copyLen-1] == '\n')) {
+                                                    copyLen--;
+                                                }
+                                                if (copyLen > 0) {
+                                                    size_t currLen = strlen(outBuf);
+                                                    memcpy(outBuf + currLen, eStart, copyLen);
+                                                    outBuf[currLen + copyLen] = '\0';
+                                                }
+                                                first = 0;
+                                            }
+                                            if (!nextObj) break;
+                                            eStart = nextObj;
+                                        }
+                                        free(fileBuf);
+                                    }
+                                    if (!first) strcat(outBuf, ",");
+                                    strcat(outBuf, newJson);
+                                    strcat(outBuf, "]");
+                                    
+                                    fp = fopen(qFile, "wb");
+                                    if (fp) { fwrite(outBuf, 1, strlen(outBuf), fp); fclose(fp); }
+                                    free(outBuf);
+                                    
+                                    importedCount++;
+                                    eventStart++;
+                                }
+                                free(icsBuf);
+                                char msg[256]; snprintf(msg, sizeof(msg), "Successfully imported %d events from ICS.", importedCount);
+                                MessageBoxA(hWnd, msg, SERVER_NAME, MB_ICONINFORMATION);
+                            }
+                            fclose(fIn);
+                        }
                     }
                     break;
                 }
                 case ID_MENU_EXPORT: {
                     OPENFILENAMEA ofn = {0};
-                    char szFile[MAX_PATH] = "calendar_export.json";
+                    char szFile[MAX_PATH] = "calendar_export.ics";
                     ofn.lStructSize = sizeof(ofn);
                     ofn.hwndOwner = hWnd;
-                    ofn.lpstrFilter = "JSON Files (*.json)\0*.json\0";
+                    ofn.lpstrFilter = "iCalendar Files (*.ics)\0*.ics\0";
                     ofn.lpstrFile = szFile;
                     ofn.nMaxFile = MAX_PATH;
                     ofn.Flags = OFN_OVERWRITEPROMPT;
-                    ofn.lpstrDefExt = "json";
+                    ofn.lpstrDefExt = "ics";
                     if (GetSaveFileNameA(&ofn)) {
                         FILE* fOut = fopen(szFile, "wb");
                         if (fOut) {
-                            fwrite("[", 1, 1, fOut);
+                            const char* header = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalDAV-D//EN\r\n";
+                            fwrite(header, 1, strlen(header), fOut);
+                            
                             WIN32_FIND_DATA fd;
                             char searchPath[MAX_PATH];
                             snprintf(searchPath, sizeof(searchPath), "%s\\*.json", DATA_DIR);
                             HANDLE hFind = FindFirstFile(searchPath, &fd);
-                            int first = 1;
+                            
                             if (hFind != INVALID_HANDLE_VALUE) {
                                 do {
                                     if (strcmp(fd.cFileName, "people.json") == 0) continue;
@@ -1460,27 +2007,69 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                     snprintf(filepath, sizeof(filepath), "%s/%s", DATA_DIR, fd.cFileName);
                                     FILE* fp = fopen(filepath, "rb");
                                     if (fp) {
-                                        fseek(fp, 0, SEEK_END);
-                                        long size = ftell(fp);
-                                        fseek(fp, 0, SEEK_SET);
-                                        if (size > 0) {
-                                            if (!first) fwrite(",", 1, 1, fOut);
-                                            char* buf = malloc(size);
-                                            if (buf) {
-                                                fread(buf, 1, size, fp);
-                                                fwrite(buf, 1, size, fOut);
-                                                free(buf);
+                                        fseek(fp, 0, SEEK_END); long size = ftell(fp); fseek(fp, 0, SEEK_SET);
+                                        char* fileBuf = malloc(size + 1);
+                                        if (fileBuf) {
+                                            fread(fileBuf, 1, size, fp); fileBuf[size] = '\0';
+                                            
+                                            char* eventStart = fileBuf;
+                                            while ((eventStart = strstr(eventStart, "{\"id\":")) != NULL) {
+                                                char id[64] = {0}, title[128] = "Untitled Event", date[16] = {0};
+                                                int startMin = 0, duration = 60;
+                                                
+                                                char* pId = strstr(eventStart, "\"id\":\"");
+                                                if (pId) sscanf(pId + 6, "%63[^\"]", id);
+                                                
+                                                char* pTitle = strstr(eventStart, "\"title\":\"");
+                                                if (pTitle) sscanf(pTitle + 9, "%127[^\"]", title);
+                                                
+                                                char* pDate = strstr(eventStart, "\"date\":\"");
+                                                if (pDate) sscanf(pDate + 8, "%15[^\"]", date);
+                                                
+                                                char* pStart = strstr(eventStart, "\"startMin\":");
+                                                if (pStart) sscanf(pStart + 11, "%d", &startMin);
+                                                
+                                                char* pDur = strstr(eventStart, "\"duration\":");
+                                                if (pDur) sscanf(pDur + 11, "%d", &duration);
+                                                
+                                                char icsDate[9] = {0};
+                                                if (strlen(date) >= 10) {
+                                                    icsDate[0] = date[0]; icsDate[1] = date[1]; icsDate[2] = date[2]; icsDate[3] = date[3];
+                                                    icsDate[4] = date[5]; icsDate[5] = date[6];
+                                                    icsDate[6] = date[8]; icsDate[7] = date[9];
+                                                }
+                                                
+                                                int startH = startMin / 60;
+                                                int startM = startMin % 60;
+                                                int endMin = startMin + duration;
+                                                int endH = endMin / 60;
+                                                int endM = endMin % 60;
+                                                
+                                                char eventBuf[2048];
+                                                snprintf(eventBuf, sizeof(eventBuf),
+                                                    "BEGIN:VEVENT\r\n"
+                                                    "UID:%s\r\n"
+                                                    "DTSTAMP:%sT%02d%02d00\r\n"
+                                                    "DTSTART:%sT%02d%02d00\r\n"
+                                                    "DTEND:%sT%02d%02d00\r\n"
+                                                    "SUMMARY:%s\r\n"
+                                                    "END:VEVENT\r\n",
+                                                    id, icsDate, startH, startM, icsDate, startH, startM, icsDate, endH, endM, title);
+                                                    
+                                                fwrite(eventBuf, 1, strlen(eventBuf), fOut);
+                                                eventStart++;
                                             }
-                                            first = 0;
+                                            free(fileBuf);
                                         }
                                         fclose(fp);
                                     }
                                 } while (FindNextFile(hFind, &fd));
                                 FindClose(hFind);
                             }
-                            fwrite("]", 1, 1, fOut);
+                            const char* footer = "END:VCALENDAR\r\n";
+                            fwrite(footer, 1, strlen(footer), fOut);
                             fclose(fOut);
-                            MessageBoxA(hWnd, "Calendar exported successfully.", SERVER_NAME, MB_ICONINFORMATION);
+                            MessageBoxA(hWnd, "Calendar exported to ICS successfully.", SERVER_NAME, MB_ICONINFORMATION);
                         }
                     }
                     break;
@@ -1494,7 +2083,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
-
 VOID CreateTrayIcon(HWND hWnd) {
     g_nid.hWnd = hWnd; g_nid.uID = ID_TRAY_ICON; g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON; g_nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
@@ -1507,8 +2095,8 @@ VOID ShowContextMenu(HWND hWnd) {
     AppendMenu(hMenu, MF_STRING | (g_bRunning ? MF_CHECKED : MF_UNCHECKED), ID_MENU_START, "Start Server\tCtrl+S");
     AppendMenu(hMenu, MF_STRING | (!g_bRunning ? MF_CHECKED : MF_UNCHECKED), ID_MENU_STOP, "Stop Server\tCtrl+T");
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenu(hMenu, MF_STRING, ID_MENU_IMPORT, "Import Calendar (.json)");
-    AppendMenu(hMenu, MF_STRING, ID_MENU_EXPORT, "Export Calendar (.json)");
+    AppendMenu(hMenu, MF_STRING, ID_MENU_IMPORT, "Import Calendar (.ics)");
+    AppendMenu(hMenu, MF_STRING, ID_MENU_EXPORT, "Export Calendar (.ics)");
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hMenu, MF_STRING, ID_MENU_SETTINGS, "Settings...\tCtrl+P");
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);

@@ -25,6 +25,7 @@
         #canvas-container { height: calc(100vh - 44px); display: block; overflow-y: auto; overflow-x: hidden; position: relative; width: 100%; }
         #header-row { position: sticky; top: 0; z-index: 50; height: 30px; background: #f8f9fa; border-bottom: 1px solid #dadce0; display: flex; padding-left: 65px; width: 100%; box-sizing: border-box; }
         .col-header { flex: 1; text-align: center; font-size: 13px; font-weight: 600; color: #3c4043; line-height: 30px; border-right: 1px solid #dadce0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .edit-person-input { width: 90%; font-size: 13px; text-align: center; }
 
         #scroll-area { position: relative; display: flex; width: 100%; height: auto; overflow: visible; }
         #timeline-labels { width: 65px; flex-shrink: 0; position: relative; background: #fff; border-right: 1px solid #dadce0; }
@@ -58,7 +59,7 @@
         .modal-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
         
         .chk-list { max-height: 200px; overflow-y: auto; text-align: left; margin-bottom: 12px; border: 1px solid #ccc; padding: 8px; }
-        .chk-list div { margin-bottom: 6px; }
+        .chk-list div { margin-bottom: 6px; display: flex; align-items: center; }
         .chk-list label { margin-left: 6px; cursor: pointer; }
 
         @media (max-width: 768px) {
@@ -72,6 +73,9 @@
             .event-card { padding: 2px; font-size: 10px; }
             .event-title { font-size: 11px; margin-bottom: 0px; }
             .event-time { font-size: 9px; }
+            .month-grid { grid-template-rows: repeat(6, minmax(45px, 1fr)); }
+            .month-cell { min-height: 45px; padding: 2px; }
+            .month-event { font-size: 9px; padding: 1px 2px; margin-bottom: 1px; }
         }
     </style>
 </head>
@@ -88,7 +92,6 @@
             <option value="6">Month View</option>
             <option value="7">Upcoming Schedule</option>
         </select>
-        <button id="btnFilterPeople" style="display: none; height: 26px; padding: 2px 4px; font-size: 11px; cursor: pointer; border: 1px solid #ccc; background: #fff; border-radius: 3px;">Filter People</button>
         <div id="lblDateTitleMobile"></div>
     </div>
     
@@ -102,6 +105,8 @@
             <button id="btnNext">Next &gt;</button>
         </div>
         <div id="lblDateTitle"></div>
+        <button id="btnFilterPeople" style="display: inline-block;">Filter People</button>
+        <button id="btnCloneForUsers" title="Clone Selected Event for Multiple Users" style="display: inline-block;">Clone for Users</button>
         <button id="btnSync">Sync (Download)</button>
         <button id="btnImportRemote">Import Remote Server</button>
         <button id="btnCopy">Copy Selected</button>
@@ -153,6 +158,15 @@
         <div class="modal-buttons">
             <button onclick="document.getElementById('peopleFilterModal').style.display='none'">Close</button>
             <button id="btnSavePeopleFilter">Save Filter</button>
+        </div>
+    </div>
+
+    <div id="cloneUsersModal" class="modal">
+        <h3>Clone Event for Users</h3>
+        <div id="cloneUsersList" class="chk-list"></div>
+        <div class="modal-buttons">
+            <button onclick="document.getElementById('cloneUsersModal').style.display='none'">Cancel</button>
+            <button id="btnDoCloneUsers">Clone</button>
         </div>
     </div>
 
