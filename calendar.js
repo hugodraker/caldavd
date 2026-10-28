@@ -33,7 +33,7 @@ function getAuthHeader() { return authHeader; }
 
 // Global Delete Key Binding
 window.addEventListener('keydown', (e) => {
-    if (e.key === 'Delete' && selectedEventId && !window.isEditing && document.activeElement.tagName !== 'INPUT') {
+    if (e.key === 'Delete' && selectedEventId && !window.isEditing && document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'SELECT') {
         document.getElementById('btnDelete')?.click();
     }
 });
@@ -334,20 +334,201 @@ async function deleteEventFromCalDAV(evToDel) {
     } catch (e) {}
 }
 
+function handleVCardUpload(e) {
+    let file = e.target.files[0];
+    if (!file) return;
+    let reader = new FileReader();
+    reader.onload = function(evt) {
+        let content = evt.target.result;
+        let lines = content.split(/\r?\n/);
+        let currentContact = null;
+
+        for (let line of lines) {
+            if (line.trim() === "BEGIN:VCARD") {
+                currentContact = { username: "", fn: "", n: "", tel: "", email: "", adr: "", org: "", title: "", url: "", bday: "", note: "" };
+            } else if (line.trim() === "END:VCARD") {
+                if (currentContact) contacts.push(currentContact);
+                currentContact = null;
+            } else if (currentContact) {
+                let match = line.match(/^([^:]+):(.*)$/);
+                if (match) {
+                    let key = match[1].split(';')[0].toUpperCase();
+                    let val = match[2];
+                    if (key === 'FN') currentContact.fn = val;
+                    else if (key === 'N') currentContact.n = val;
+                    else if (key === 'TEL') currentContact.tel = val;
+                    else if (key === 'EMAIL') currentContact.email = val;
+                    else if (key === 'ADR') currentContact.adr = val;
+                    else if (key === 'ORG') currentContact.org = val;
+                    else if (key === 'TITLE') currentContact.title = val;
+                    else if (key === 'URL') currentContact.url = val;
+                    else if (key === 'BDAY') currentContact.bday = val;
+                    else if (key === 'NOTE') currentContact.note = val;
+                }
+            }
+        }
+        renderContactsList();
+        document.getElementById('btnSaveContacts').click(); // Auto-save to server on import
+    };
+    reader.readAsText(file);
+    e.target.value = ''; 
+}
+
+// Remove the old btnDownloadVCard event listener block, and add this:
+
+document.getElementById('btnDownloadSingleVCard')?.addEventListener('click', () => {
+    let idx = parseInt(document.getElementById('editContactIdx').value);
+    if (isNaN(idx) || idx < 0 || idx >= contacts.length) return;
+    
+    let c = contacts[idx];
+    let vcf = "BEGIN:VCARD\r\nVERSION:3.0\r\n";
+    
+    // Pull from the active inputs so the user can download unsaved edits
+    let fn = document.getElementById('editContactFn').value || c.fullname || 'Unnamed Contact';
+    let n = document.getElementById('editContactN').value;
+    let email = document.getElementById('editContactEmail').value;
+    let tel = document.getElementById('editContactTel').value;
+    let adr = document.getElementById('editContactAdr').value;
+    let org = document.getElementById('editContactOrg').value;
+    let title = document.getElementById('editContactTitle').value;
+    let url = document.getElementById('editContactUrl').value;
+    let bday = document.getElementById('editContactBday').value;
+    let note = document.getElementById('editContactNote').value;
+
+    vcf += `FN:${fn}\r\n`;
+    if (n) vcf += `N:${n}\r\n`;
+    if (email) vcf += `EMAIL:${email}\r\n`;
+    if (tel) vcf += `TEL:${tel}\r\n`;
+    if (adr) vcf += `ADR:${adr}\r\n`;
+    if (org) vcf += `ORG:${org}\r\n`;
+    if (title) vcf += `TITLE:${title}\r\n`;
+    if (url) vcf += `URL:${url}\r\n`;
+    if (bday) vcf += `BDAY:${bday}\r\n`;
+    if (note) vcf += `NOTE:${note}\r\n`;
+    vcf += "END:VCARD\r\n";
+    
+    let blob = new Blob([vcf], {type: "text/vcard"});
+    let urlObj = URL.createObjectURL(blob);
+    let a = document.createElement('a');
+    a.href = urlObj;
+    let safeName = fn.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    a.download = safeName + ".vcf";
+    a.click();
+    URL.revokeObjectURL(urlObj);
+});
+
+window.openContactEditor = function(idx) {
+    let c = contacts[idx];
+    document.getElementById('editContactIdx').value = idx;
+    document.getElementById('editContactIdx').dataset.oldUsername = c.username || '';
+    
+    let dl = document.getElementById('availableUsernames');
+    dl.innerHTML = '';
+    
+    // Filter available usernames (don't show ones already assigned to *other* contacts)
+    people.forEach(p => {
+        if (p && !p.startsWith("Person ")) {
+            let isUsed = contacts.some((otherC, otherIdx) => otherIdx !== idx && otherC.username === p);
+            if (!isUsed) {
+                dl.innerHTML += `<option value="${p}">`;
+            }
+        }
+    });
+    
+    document.getElementById('editContactUsername').value = c.username || '';
+    document.getElementById('editContactFn').value = c.fn || c.fullname || '';
+    document.getElementById('editContactN').value = c.n || '';
+    document.getElementById('editContactEmail').value = c.email || '';
+    document.getElementById('editContactTel').value = c.tel || '';
+    document.getElementById('editContactAdr').value = c.adr || '';
+    document.getElementById('editContactOrg').value = c.org || '';
+    document.getElementById('editContactTitle').value = c.title || '';
+    document.getElementById('editContactUrl').value = c.url || '';
+    document.getElementById('editContactBday').value = c.bday || '';
+    document.getElementById('editContactNote').value = c.note || '';
+    
+    document.getElementById('contactEditorModal').style.display = 'flex';
+};
+
+document.getElementById('btnSaveSingleContact')?.addEventListener('click', async () => {
+    let idx = parseInt(document.getElementById('editContactIdx').value);
+    if (isNaN(idx) || idx < 0 || idx >= contacts.length) return;
+    
+    let c = contacts[idx];
+    let newUsername = document.getElementById('editContactUsername').value.trim();
+    let oldUsername = document.getElementById('editContactIdx').dataset.oldUsername || '';
+    
+    if (newUsername !== "") {
+        let isUsed = contacts.some((otherC, otherIdx) => otherIdx !== idx && otherC.username === newUsername);
+        if (isUsed) {
+            alert("This username is already linked to another contact. Unique links are required.");
+            return;
+        }
+    }
+    
+    c.username = newUsername;
+    c.fn = document.getElementById('editContactFn').value;
+    c.n = document.getElementById('editContactN').value;
+    c.email = document.getElementById('editContactEmail').value;
+    c.tel = document.getElementById('editContactTel').value;
+    c.adr = document.getElementById('editContactAdr').value;
+    c.org = document.getElementById('editContactOrg').value;
+    c.title = document.getElementById('editContactTitle').value;
+    c.url = document.getElementById('editContactUrl').value;
+    c.bday = document.getElementById('editContactBday').value;
+    c.note = document.getElementById('editContactNote').value;
+    
+    delete c.fullname; // Cleanup legacy property if present
+    
+    if (newUsername !== oldUsername && newUsername !== "") {
+        let payload = oldUsername ? `${oldUsername}|${newUsername}` : newUsername;
+        try {
+            await fetch(`${window.location.origin}/api/user`, {
+                method: 'PUT',
+                headers: { 'Authorization': getAuthHeader() },
+                body: payload
+            });
+            let pIdx = people.indexOf(oldUsername);
+            if (oldUsername && pIdx !== -1) {
+                people[pIdx] = newUsername;
+            } else if (people.indexOf(newUsername) === -1) {
+                people.push(newUsername);
+            }
+            putPeopleToCalDAV();
+        } catch(e) {}
+    }
+    
+    document.getElementById('contactEditorModal').style.display = 'none';
+    renderContactsList();
+});
+
 function renderContactsList() {
     const list = document.getElementById('contactsList');
     if (!list) return;
     list.innerHTML = '';
+    const filterText = (document.getElementById('contactFilter')?.value || '').toLowerCase();
+    
     contacts.forEach((c, idx) => {
+        let displayFn = c.fn || c.fullname || '';
+        if (filterText && !(c.username || '').toLowerCase().includes(filterText) && !displayFn.toLowerCase().includes(filterText)) return;
+        
         let div = document.createElement('div');
         div.style.display = 'flex';
-        div.style.gap = '6px';
-        div.style.marginBottom = '6px';
+        div.style.justifyContent = 'space-between';
+        div.style.alignItems = 'center';
+        div.style.padding = '8px 12px';
+        div.style.borderBottom = '1px solid #dadce0';
+        
+        let linkText = c.username ? ` (Linked: ${c.username})` : '';
         div.innerHTML = `
-            <input type="text" placeholder="Short Name (e.g. Jack)" value="${c.username || ''}" onchange="contacts[${idx}].username=this.value" style="width:30%; margin:0;">
-            <input type="text" placeholder="Full Name" value="${c.fullname || ''}" onchange="contacts[${idx}].fullname=this.value" style="width:40%; margin:0;">
-            <input type="text" placeholder="Email" value="${c.email || ''}" onchange="contacts[${idx}].email=this.value" style="width:30%; margin:0;">
-            <button onclick="contacts.splice(${idx}, 1); renderContactsList();" style="cursor:pointer; color:red; font-weight:bold; border:1px solid #ccc; border-radius:3px; padding:0 8px;">X</button>
+            <div style="display:flex; flex-direction:column;">
+                <b style="font-size:14px; color:#202124;">${displayFn || 'Unnamed Contact'}</b>
+                <span style="font-size:11px; color:#5f6368;">${c.email || 'No email'}${linkText}</span>
+            </div>
+            <div style="display:flex; gap: 6px;">
+                <button onclick="openContactEditor(${idx})" style="cursor:pointer; border:1px solid #ccc; border-radius:4px; padding:4px 12px; background:#f8f9fa;">Edit</button>
+                <button onclick="contacts.splice(${idx}, 1); renderContactsList();" style="cursor:pointer; color:#d93025; border:1px solid #dadce0; border-radius:4px; padding:4px 12px; background:#fff;">Delete</button>
+            </div>
         `;
         list.appendChild(div);
     });
@@ -355,12 +536,13 @@ function renderContactsList() {
 
 document.getElementById('btnContacts')?.addEventListener('click', () => {
     renderContactsList();
-    document.getElementById('contactsModal').style.display = 'block';
+    document.getElementById('contactsModal').style.display = 'flex';
 });
 
 document.getElementById('btnAddContact')?.addEventListener('click', () => {
-    contacts.push({ username: "", fullname: "", email: "" });
+    contacts.push({ username: "", fn: "", n: "", tel: "", email: "", adr: "", org: "", title: "", url: "", bday: "", note: "" });
     renderContactsList();
+    openContactEditor(contacts.length - 1);
 });
 
 document.getElementById('btnSaveContacts')?.addEventListener('click', async () => {
@@ -370,6 +552,7 @@ document.getElementById('btnSaveContacts')?.addEventListener('click', async () =
         body: JSON.stringify(contacts)
     });
     document.getElementById('contactsModal').style.display = 'none';
+    render();
 });
 
 function renderTimeline() {
@@ -393,7 +576,10 @@ function renderTimeline() {
         
         if (isPeopleView()) {
             let pIdx = visiblePeopleIndices[i];
-            div.innerText = people[pIdx] || `Person ${pIdx + 1}`;
+            let shortName = people[pIdx] || `Person ${pIdx + 1}`;
+            let contactMatch = contacts.find(c => c.username === shortName);
+            div.innerText = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : shortName;
+            
             div.ondblclick = () => {
                 let input = document.createElement('input');
                 input.className = 'edit-person-input';
@@ -744,7 +930,9 @@ function renderUpcoming() {
     sorted.forEach(ev => {
         let card = document.createElement('div');
         card.className = 'upcoming-card';
-        let p = people[ev.personIdx] || "";
+        let shortName = people[ev.personIdx] || "";
+        let contactMatch = contacts.find(c => c.username === shortName);
+        let p = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : shortName;
         card.innerHTML = `
             <div class="upcoming-color" style="background:${ev.color}"></div>
             <div class="upcoming-details">
@@ -1205,7 +1393,7 @@ document.getElementById('btnPrint')?.addEventListener('click', () => {
             if (isPeopleView()) {
                 let shortName = people[visiblePeopleIndices[c]];
                 let contactMatch = contacts.find(contact => contact.username === shortName);
-                hdr = (contactMatch && contactMatch.fullname) ? contactMatch.fullname : shortName;
+                hdr = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : shortName;
             } else {
                 let d = new Date(currentDate); 
                 d.setDate(d.getDate() + c); 
@@ -1262,7 +1450,7 @@ document.getElementById('btnPrint')?.addEventListener('click', () => {
     if (visiblePeopleIndices.length === 1) {
         let shortName = people[visiblePeopleIndices[0]] || currentUser || "Calendar";
         let contactMatch = contacts.find(c => c.username === shortName);
-        let finalName = (contactMatch && contactMatch.fullname) ? contactMatch.fullname : shortName;
+        let finalName = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : shortName;
         pdfName = finalName.replace(/[^a-z0-9]/gi, '_') + "_Schedule.pdf";
     } else if (currentUser) {
         pdfName = currentUser.replace(/[^a-z0-9]/gi, '_') + "_Schedule.pdf";

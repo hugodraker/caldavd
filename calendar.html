@@ -52,8 +52,8 @@
         .event-card { position: absolute; border-radius: 4px; padding: 4px 8px; font-size: 12px; color: #fff; pointer-events: auto; cursor: grab; box-shadow: 0 1px 3px rgba(0,0,0,0.2); overflow: hidden; display: block; }
         .event-card:active { cursor: grabbing; opacity: 0.9; }
         .event-card.selected { outline: 2px solid #000; z-index: 10; }
-        .event-title { font-weight: 600; margin-bottom: 2px; pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .event-time { font-size: 11px; opacity: 0.9; pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .event-title { font-weight: 600; margin-bottom: 2px; pointer-events: none; white-space: normal; overflow-wrap: break-word; }
+        .event-time { font-size: 11px; opacity: 0.9; pointer-events: none; white-space: normal; overflow-wrap: break-word; }
         .resize-handle { position: absolute; bottom: 0; left: 0; right: 0; height: 12px; cursor: ns-resize; background: rgba(0,0,0,0.1); z-index: 5; }
         .resize-handle:hover { background: rgba(0,0,0,0.3); }
 
@@ -71,7 +71,7 @@
         .modal { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #fff; padding: 24px; border: 1px solid #dadce0; border-radius: 8px; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.15); width: 320px; }
         .modal h3 { margin-top: 0; color: #202124; }
         .modal input[type="text"], .modal input[type="password"] { width: 100%; margin-bottom: 12px; padding: 6px; border: 1px solid #ccc; border-radius: 4px; }
-        .modal-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+        .modal-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
         
         .chk-list { max-height: 200px; overflow-y: auto; text-align: left; margin-bottom: 12px; border: 1px solid #ccc; padding: 8px; }
         .chk-list div { margin-bottom: 6px; display: flex; align-items: center; }
@@ -122,13 +122,14 @@
         <div id="lblDateTitle"></div>
         <button id="btnFilterPeople" style="display: inline-block;">Filter People</button>
         <button id="btnCloneForUsers" title="Clone Selected Event for Multiple Users" style="display: inline-block;">Clone for Users</button>
-        <button id="btnSync">Sync (Download)</button>
+        <button id="btnSync" style="display: none;">Sync (Download)</button>
+        <button id="btnContacts">Edit Contacts</button>
         <button id="btnImportRemote">Import Remote Server</button>
         <button id="btnCopy">Copy Selected</button>
         <button id="btnDelete">Delete Selected</button>
         <button id="btnPrint">Save PDF</button>
-        <button id="btnExport">Export</button>
-        <button id="btnLogout" style="color: red; font-weight: bold;">Logout</button>
+        <button id="btnExport">Export Schedule</button>
+        <button id="btnLogout">Logout</button>
     </div>
     
     <div id="canvas-container">
@@ -182,6 +183,52 @@
         <div class="modal-buttons">
             <button onclick="document.getElementById('cloneUsersModal').style.display='none'">Cancel</button>
             <button id="btnDoCloneUsers">Clone</button>
+        </div>
+    </div>
+    
+    <!-- Contacts List Modal -->
+    <div id="contactsModal" class="modal" style="width: 500px; max-width: 95vw; height: 75vh; max-height: 800px; display: none; flex-direction: column;">
+        <h3 style="flex-shrink: 0; margin-bottom: 10px;">CardDAV Contacts</h3>
+        <input type="text" id="contactFilter" placeholder="Filter contacts by name or username..." onkeyup="renderContactsList()" style="flex-shrink: 0;">
+        <div id="contactsList" class="chk-list" style="flex: 1; max-height: none; overflow-y: auto; padding-right: 5px; background: #fff;"></div>
+        <div class="modal-buttons" style="flex-shrink: 0;">
+            <input type="file" id="vcardUpload" accept=".vcf,.vcard" style="display:none;" onchange="handleVCardUpload(event)">
+            <button onclick="document.getElementById('vcardUpload').click()">Upload vCard</button>
+            <button id="btnAddContact">Add Contact</button>
+            <button id="btnSaveContacts" style="background:#039BE5; color:#fff; border:none;">Save to Server</button>
+            <button onclick="document.getElementById('contactsModal').style.display='none'">Close</button>
+        </div>
+    </div>
+
+    <!-- Contact Editor Modal -->
+    <div id="contactEditorModal" class="modal" style="width: 600px; max-width: 95vw; display: none; flex-direction: column; z-index: 105;">
+        <h3>Edit Contact</h3>
+        <input type="hidden" id="editContactIdx" value="">
+        <div id="contactEditorFields" style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; padding: 10px 0;">
+            <div><label style="font-size:11px; color:#5f6368;">Linked Username (Type to create/link):</label><br>
+                 <input type="text" id="editContactUsername" list="availableUsernames" style="width:100%; padding:4px;">
+                 <datalist id="availableUsernames"></datalist>
+            </div>
+            <div><label style="font-size:11px; color:#5f6368;">Full Name (FN):</label><br><input type="text" id="editContactFn" style="width:100%; padding:4px;"></div>
+            
+            <div><label style="font-size:11px; color:#5f6368;">Name Parts (N):</label><br><input type="text" id="editContactN" style="width:100%; padding:4px;" placeholder="Family;Given;Middle;Prefix;Suffix"></div>
+            <div><label style="font-size:11px; color:#5f6368;">Email (EMAIL):</label><br><input type="text" id="editContactEmail" style="width:100%; padding:4px;"></div>
+            
+            <div><label style="font-size:11px; color:#5f6368;">Phone (TEL):</label><br><input type="text" id="editContactTel" style="width:100%; padding:4px;"></div>
+            <div><label style="font-size:11px; color:#5f6368;">Address (ADR):</label><br><input type="text" id="editContactAdr" style="width:100%; padding:4px;" placeholder=";;Street;City;State;Zip;Country"></div>
+            
+            <div><label style="font-size:11px; color:#5f6368;">Organization (ORG):</label><br><input type="text" id="editContactOrg" style="width:100%; padding:4px;"></div>
+            <div><label style="font-size:11px; color:#5f6368;">Title (TITLE):</label><br><input type="text" id="editContactTitle" style="width:100%; padding:4px;"></div>
+            
+            <div><label style="font-size:11px; color:#5f6368;">URL:</label><br><input type="text" id="editContactUrl" style="width:100%; padding:4px;"></div>
+            <div><label style="font-size:11px; color:#5f6368;">Birthday (BDAY):</label><br><input type="text" id="editContactBday" style="width:100%; padding:4px;"></div>
+            
+            <div style="grid-column: span 2;"><label style="font-size:11px; color:#5f6368;">Note (NOTE):</label><br><input type="text" id="editContactNote" style="width:100%; padding:4px;"></div>
+        </div>
+        <div class="modal-buttons" style="flex-shrink: 0; margin-top: 16px;">
+            <button id="btnDownloadSingleVCard" style="margin-right: auto;">Download vCard</button>
+            <button id="btnSaveSingleContact" style="background:#039BE5; color:#fff; border:none;">Done</button>
+            <button onclick="document.getElementById('contactEditorModal').style.display='none'">Cancel</button>
         </div>
     </div>
 
