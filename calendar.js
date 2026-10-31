@@ -953,6 +953,9 @@ function render() {
 }
 
 window.addEventListener('resize', () => {
+    // Prevent layout thrashing when the mobile keyboard changes the viewport height
+    if (window.isEditing) return; 
+    
     render();
     updateLayout();
 });
