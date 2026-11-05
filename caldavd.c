@@ -1250,6 +1250,25 @@ VOID HandleCommandLine(ClientThreadCtx* ctx, char* buffer, char* response, const
             }
             return;
         }
+        else if (strcmp(path, "/api/setting") == 0) {
+            char key[128] = {0};
+            char* keyPtr = strstr(buffer, "key=");
+            if (keyPtr) {
+                keyPtr += 4;
+                char* end = strchr(keyPtr, ' ');
+                if (!end) end = strchr(keyPtr, '&');
+                if (!end) end = strchr(keyPtr, '\r');
+                if (end && (end - keyPtr) < 127) {
+                    strncpy(key, keyPtr, end - keyPtr);
+                } else {
+                    strncpy(key, keyPtr, 127);
+                }
+            }
+            char val[1024] = "";
+            GetPrivateProfileString("settings", key, "", val, sizeof(val), CONFIG_FILE);
+            SendHTTPResponse(ctx, "200 OK", "text/plain", val, strlen(val), NULL);
+            return;
+        }
         else if (strcmp(path, "/calendar/all") == 0) {
             char* responseBody = (char*)malloc(1024 * 1024);
             if (responseBody) {
@@ -1379,6 +1398,21 @@ VOID HandleCommandLine(ClientThreadCtx* ctx, char* buffer, char* response, const
             } else {
                 char prefKey[256]; snprintf(prefKey, sizeof(prefKey), "%s_visible", authUser);
                 WritePrivateProfileString("prefs", prefKey, "", CONFIG_FILE);
+            }
+            SendHTTPResponse(ctx, "200 OK", "text/plain", "Saved", 5, NULL);
+            return;
+        }
+        else if (strcmp(path, "/api/setting") == 0) {
+            if (body && contentLen > 0) {
+                char* safeBody = malloc(contentLen + 1);
+                memcpy(safeBody, body, contentLen);
+                safeBody[contentLen] = '\0';
+                char* eq = strchr(safeBody, '=');
+                if (eq) {
+                    *eq = '\0';
+                    WritePrivateProfileString("settings", safeBody, eq + 1, CONFIG_FILE);
+                }
+                free(safeBody);
             }
             SendHTTPResponse(ctx, "200 OK", "text/plain", "Saved", 5, NULL);
             return;
@@ -1974,15 +2008,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                             char* nextObj = strstr(eStart + 1, "{\"id\":");
                                             if (strcmp(currentId, uid) != 0) {
                                                 if (!first) strcat(outBuf, ",");
-                                                size_t copyLen = nextObj ? (size_t)(nextObj - eStart) : strlen(eStart);
-                                                while (copyLen > 0 && (eStart[copyLen-1] == ']' || eStart[copyLen-1] == ',' || eStart[copyLen-1] == ' ' || eStart[copyLen-1] == '\r' || eStart[copyLen-1] == '\n')) {
-                                                    copyLen--;
-                                                }
-                                                if (copyLen > 0) {
-                                                    size_t currLen = strlen(outBuf);
-                                                    memcpy(outBuf + currLen, eStart, copyLen);
-                                                    outBuf[currLen + copyLen] = '\0';
-                                                }
+                                                int copyLen = nextObj ? (nextObj - eStart) : strlen(eStart);
+                                                while (copyLen > 0 && (eStart[copyLen-1] == ']' || eStart[copyLen-1] == ',' || eStart[copyLen-1] == ' ' || eStart[copyLen-1] == '\r' || eStart[copyLen-1] == '\n')) copyLen--;
+                                                strncat(outBuf, eStart, copyLen);
                                                 first = 0;
                                             }
                                             if (!nextObj) break;
@@ -2114,6 +2142,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
+
 VOID CreateTrayIcon(HWND hWnd) {
     g_nid.hWnd = hWnd; g_nid.uID = ID_TRAY_ICON; g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON; g_nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);

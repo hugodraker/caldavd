@@ -1,11 +1,11 @@
-<!--  ============================================================================ -->
+//  ============================================================================ 
 //    CalDAV Server & HTTP Web Server - Front End GUI
  
 //    2026 HUGO
   
 //    THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
 //    AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
-<!--  ============================================================================ -->
+//  ============================================================================ 
 const hostname = window.location.hostname || "127.0.0.1";
 const CALDAV_URL = window.location.origin + '/calendar/';
 const CONFIG_URL = window.location.origin + '/config/';
@@ -19,10 +19,76 @@ let contacts = [];
 let isDragging = false, isResizing = false;
 let isMonthDragging = false, monthDragEv = null;
 window.isEditing = false;
+window.isScheduling = false; 
+
+function isEditMode() {
+    const chk = document.getElementById('chkEditMode');
+    return chk && chk.checked;
+}
+
+function validateSchedInput(type, val) {
+    if (!val || val.toLowerCase() === 'clear' || val.toLowerCase() === 'default') return true;
+    if (['weekly', 'daily', 'rest'].includes(type)) {
+        let num = parseFloat(val);
+        return !isNaN(num) && num >= 0;
+    }
+    if (['coverage', 'pref'].includes(type)) {
+        let parts = val.split(',');
+        for (let p of parts) {
+            let pTrim = p.trim();
+            if (!pTrim) continue;
+            let bounds = pTrim.split('-');
+            if (bounds.length !== 2) return false;
+            let t1 = parseTimeStr(bounds[0]);
+            let t2 = parseTimeStr(bounds[1]);
+            if (isNaN(t1) || isNaN(t2)) return false;
+        }
+        return true;
+    }
+    if (type === 'days') {
+        return /^([1-7](,[1-7])*)?$/.test(val.replace(/\s/g, ''));
+    }
+    return true;
+}
+
+function populateTempFilter() {
+    let sel = document.getElementById('comboTempPersonFilter');
+    if (!sel) return;
+    let currentVal = sel.value;
+    sel.innerHTML = '<option value="">None</option>';
+    people.forEach((p, idx) => {
+        if (!p) return;
+        if (visiblePeopleIndices.length > 0 && !visiblePeopleIndices.includes(idx)) return;
+        
+        let contactMatch = contacts.find(c => c.username === p);
+        let pDisp = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : p;
+        let opt = document.createElement('option');
+        opt.value = idx;
+        opt.innerText = pDisp;
+        sel.appendChild(opt);
+    });
+    if (currentVal && sel.querySelector(`option[value="${currentVal}"]`)) {
+        sel.value = currentVal;
+    } else {
+        sel.value = "";
+    }
+}
+
+document.getElementById('comboTempPersonFilter')?.addEventListener('change', () => {
+    render();
+});
+
+function getEffectiveVisiblePeople() {
+    let sel = document.getElementById('comboTempPersonFilter');
+    if (sel && sel.value !== "") {
+        return [parseInt(sel.value)];
+    }
+    return visiblePeopleIndices;
+}
+
 let activeCard = null, activeEv = null;
-let startMouseY = 0, startMouseX = 0, originalStartMin = 0, originalDuration = 0;
+let startMouseY = 0, startMouseX = 0, originalDateStr = "", originalStartMin = 0, originalDuration = 0;
 let hasMoved = false;
-let originalDateStr = "";
 
 let currentUser = "";
 let canEditAll = false;
@@ -31,7 +97,6 @@ let visiblePeopleIndices = [];
 let authHeader = sessionStorage.getItem('caldav_auth') || "";
 function getAuthHeader() { return authHeader; }
 
-// Global Delete Key Binding
 window.addEventListener('keydown', (e) => {
     if (e.key === 'Delete' && selectedEventId && !window.isEditing && document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'SELECT') {
         document.getElementById('btnDelete')?.click();
@@ -57,14 +122,8 @@ document.getElementById('btnLogout')?.addEventListener('click', () => {
     document.getElementById('loginModal').style.display = 'block';
 });
 
-function getQuarter(dateStr) {
-    let parts = dateStr.split('/');
-    if (parts.length === 3) {
-        let y = parseInt(parts[0], 10);
-        let m = parseInt(parts[1], 10) - 1; 
-        return `${y}-Q${Math.floor(m / 3) + 1}`;
-    }
-    return '1970-Q1'; 
+function getStorageKey(dateStr) {
+    return dateStr.replace(/\//g, '-'); 
 }
 
 let people = ["Jack", "Bob", "Charlie", "David", "Eve", "Frank", "Grace"];
@@ -80,9 +139,7 @@ const lblDateTitle = document.getElementById('lblDateTitle');
 
 function updateLayout() {
     const tb = document.getElementById('toolbar');
-    if (tb) {
-        tb.style.display = tb.dataset.open === 'true' ? 'flex' : 'none';
-    }
+    if (tb) tb.style.display = tb.dataset.open === 'true' ? 'flex' : 'none';
 }
 
 document.getElementById('btnMenu')?.addEventListener('click', () => {
@@ -132,17 +189,14 @@ function unrollEvents() {
             unrolled.push({ ...ev, realId: ev.id });
             return;
         }
-
         let rules = {};
         ev.rrule.split(';').forEach(part => {
             let [key, val] = part.split('=');
             if (key && val) rules[key.toUpperCase()] = val;
         });
-
         let freq = rules['FREQ'];
         let interval = parseInt(rules['INTERVAL'] || '1', 10);
         let count = rules['COUNT'] ? parseInt(rules['COUNT'], 10) : Infinity;
-        
         let untilMs = Infinity;
         if (rules['UNTIL']) {
             let u = rules['UNTIL'];
@@ -158,23 +212,13 @@ function unrollEvents() {
 
         while (currentInst.getTime() <= winEndMs && currentInst.getTime() <= untilMs && instanceCount < count) {
             if (currentInst.getTime() >= winStartMs) {
-                unrolled.push({
-                    ...ev,
-                    id: ev.id + "_r" + instanceCount,
-                    realId: ev.id,
-                    date: formatDate(currentInst)
-                });
+                unrolled.push({ ...ev, id: ev.id + "_r" + instanceCount, realId: ev.id, date: formatDate(currentInst) });
             }
-            
-            if (freq === 'DAILY') {
-                currentInst.setDate(currentInst.getDate() + interval);
-            } else if (freq === 'WEEKLY') {
-                currentInst.setDate(currentInst.getDate() + (7 * interval));
-            } else if (freq === 'MONTHLY') {
-                currentInst.setMonth(currentInst.getMonth() + interval);
-            } else if (freq === 'YEARLY') {
-                currentInst.setFullYear(currentInst.getFullYear() + interval);
-            } else { break; }
+            if (freq === 'DAILY') currentInst.setDate(currentInst.getDate() + interval);
+            else if (freq === 'WEEKLY') currentInst.setDate(currentInst.getDate() + (7 * interval));
+            else if (freq === 'MONTHLY') currentInst.setMonth(currentInst.getMonth() + interval);
+            else if (freq === 'YEARLY') currentInst.setFullYear(currentInst.getFullYear() + interval);
+            else break;
             
             instanceCount++;
             if (instanceCount > 730) break;
@@ -193,32 +237,24 @@ document.getElementById('btnDoImport')?.addEventListener('click', async () => {
     const port = document.getElementById('remPort').value;
     const user = document.getElementById('remUser').value;
     const pass = document.getElementById('remPass').value;
-    
     try {
         const auth = btoa(`${user}:${pass}`);
         const res = await fetch(`${url}:${port}/calendar/all?t=${Date.now()}`, { headers: { 'Authorization': `Basic ${auth}` } });
         if (res.ok) {
             const importedEvents = await res.json();
             events = events.concat(importedEvents.flat()); 
-            
-            await fetch(`${CONFIG_URL}remote`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({url, port, user, pass})
-            });
+            await fetch(`${CONFIG_URL}remote`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({url, port, user, pass}) });
             alert("Successfully connected, imported data, and saved to INI.");
             document.getElementById('remoteModal').style.display = 'none';
             render();
         } else { alert("Failed to connect: " + res.statusText); }
-    } catch (e) {
-        alert("Connection error: " + e.message);
-    }
+    } catch (e) { alert("Connection error: " + e.message); }
 });
 
 setInterval(downloadUpdates, 60000);
 
 async function downloadUpdates() {
-    if (isDragging || isResizing || isMonthDragging || window.isEditing) return; 
+    if (isDragging || isResizing || isMonthDragging || window.isEditing || window.isScheduling) return; 
     
     if (!getAuthHeader()) {
         const modal = document.getElementById('loginModal');
@@ -269,9 +305,16 @@ async function downloadUpdates() {
         if (response.ok) {
             try {
                 let raw = await response.json();
-                events = Array.isArray(raw) ? raw.flat() : [];
+                if (isDragging || isResizing || isMonthDragging || window.isEditing || window.isScheduling) return; 
+                let loadedEvents = Array.isArray(raw) ? raw.flat() : [];
+                
+                let evMap = new Map();
+                loadedEvents.forEach(e => evMap.set(e.id, e));
+                events = Array.from(evMap.values());
+                
             } catch (err) {
-                events = [];
+                if (isDragging || isResizing || isMonthDragging || window.isEditing || window.isScheduling) return;
+                console.error("Calendar JSON Parse Error - Keeping current local events to prevent wiping the UI due to network glitch.", err);
             }
         }
         
@@ -280,9 +323,7 @@ async function downloadUpdates() {
         events.forEach(e => eventPeople.add(e.personIdx));
         
         if (visiblePeopleIndices.length === 0) {
-            eventPeople.forEach(idx => {
-                if (!visiblePeopleIndices.includes(idx)) visiblePeopleIndices.push(idx);
-            });
+            eventPeople.forEach(idx => { if (!visiblePeopleIndices.includes(idx)) visiblePeopleIndices.push(idx); });
             dirtyFilter = true;
         }
         if (myIdx !== -1 && !visiblePeopleIndices.includes(myIdx)) {
@@ -291,6 +332,7 @@ async function downloadUpdates() {
         }
         
         if (dirtyFilter) saveVisiblePeople();
+        populateTempFilter();
         render(); 
     } catch (e) { 
         console.error("Sync Error", e); 
@@ -300,36 +342,33 @@ async function downloadUpdates() {
 
 async function saveVisiblePeople() {
     try {
-        await fetch(`${window.location.origin}/api/prefs`, {
-            method: 'PUT',
-            headers: { 'Authorization': getAuthHeader() },
-            body: visiblePeopleIndices.join(',')
-        });
+        await fetch(`${window.location.origin}/api/prefs`, { method: 'PUT', headers: { 'Authorization': getAuthHeader() }, body: visiblePeopleIndices.join(',') });
     } catch(e) {}
 }
 
 async function putPeopleToCalDAV() {
     try {
         await fetch(`${CALDAV_URL}people.json`, { method: 'PUT', headers: { 'Content-Type': 'application/json', 'Authorization': getAuthHeader() }, body: JSON.stringify(people) });
+        populateTempFilter();
     } catch (e) {}
 }
 
 async function putEventToCalDAV(ev) {
-    let q = getQuarter(ev.date);
-    let qEvents = events.filter(e => getQuarter(e.date) === q);
+    let key = getStorageKey(ev.date);
+    let dayEvents = events.filter(e => getStorageKey(e.date) === key);
     try {
-        await fetch(`${CALDAV_URL}${q}.json`, { method: 'PUT', headers: { 'Content-Type': 'application/json', 'Authorization': getAuthHeader() }, body: JSON.stringify(qEvents) });
+        await fetch(`${CALDAV_URL}${key}.json`, { method: 'PUT', headers: { 'Content-Type': 'application/json', 'Authorization': getAuthHeader() }, body: JSON.stringify(dayEvents) });
     } catch (e) {}
 }
 
 async function deleteEventFromCalDAV(evToDel) {
-    let q = getQuarter(evToDel.date);
-    let qEvents = events.filter(e => getQuarter(e.date) === q);
+    let key = getStorageKey(evToDel.date);
+    let dayEvents = events.filter(e => getStorageKey(e.date) === key);
     try {
-        if (qEvents.length === 0) {
-            await fetch(`${CALDAV_URL}${q}.json`, { method: 'DELETE', headers: { 'Authorization': getAuthHeader() } });
+        if (dayEvents.length === 0) {
+            await fetch(`${CALDAV_URL}${key}.json`, { method: 'DELETE', headers: { 'Authorization': getAuthHeader() } });
         } else {
-            await fetch(`${CALDAV_URL}${q}.json`, { method: 'PUT', headers: { 'Content-Type': 'application/json', 'Authorization': getAuthHeader() }, body: JSON.stringify(qEvents) });
+            await fetch(`${CALDAV_URL}${key}.json`, { method: 'PUT', headers: { 'Content-Type': 'application/json', 'Authorization': getAuthHeader() }, body: JSON.stringify(dayEvents) });
         }
     } catch (e) {}
 }
@@ -368,13 +407,11 @@ function handleVCardUpload(e) {
             }
         }
         renderContactsList();
-        document.getElementById('btnSaveContacts').click(); // Auto-save to server on import
+        document.getElementById('btnSaveContacts').click(); 
     };
     reader.readAsText(file);
     e.target.value = ''; 
 }
-
-// Remove the old btnDownloadVCard event listener block, and add this:
 
 document.getElementById('btnDownloadSingleVCard')?.addEventListener('click', () => {
     let idx = parseInt(document.getElementById('editContactIdx').value);
@@ -382,37 +419,25 @@ document.getElementById('btnDownloadSingleVCard')?.addEventListener('click', () 
     
     let c = contacts[idx];
     let vcf = "BEGIN:VCARD\r\nVERSION:3.0\r\n";
-    
-    // Pull from the active inputs so the user can download unsaved edits
     let fn = document.getElementById('editContactFn').value || c.fullname || 'Unnamed Contact';
-    let n = document.getElementById('editContactN').value;
-    let email = document.getElementById('editContactEmail').value;
-    let tel = document.getElementById('editContactTel').value;
-    let adr = document.getElementById('editContactAdr').value;
-    let org = document.getElementById('editContactOrg').value;
-    let title = document.getElementById('editContactTitle').value;
-    let url = document.getElementById('editContactUrl').value;
-    let bday = document.getElementById('editContactBday').value;
-    let note = document.getElementById('editContactNote').value;
-
+    
     vcf += `FN:${fn}\r\n`;
-    if (n) vcf += `N:${n}\r\n`;
-    if (email) vcf += `EMAIL:${email}\r\n`;
-    if (tel) vcf += `TEL:${tel}\r\n`;
-    if (adr) vcf += `ADR:${adr}\r\n`;
-    if (org) vcf += `ORG:${org}\r\n`;
-    if (title) vcf += `TITLE:${title}\r\n`;
-    if (url) vcf += `URL:${url}\r\n`;
-    if (bday) vcf += `BDAY:${bday}\r\n`;
-    if (note) vcf += `NOTE:${note}\r\n`;
+    if (document.getElementById('editContactN').value) vcf += `N:${document.getElementById('editContactN').value}\r\n`;
+    if (document.getElementById('editContactEmail').value) vcf += `EMAIL:${document.getElementById('editContactEmail').value}\r\n`;
+    if (document.getElementById('editContactTel').value) vcf += `TEL:${document.getElementById('editContactTel').value}\r\n`;
+    if (document.getElementById('editContactAdr').value) vcf += `ADR:${document.getElementById('editContactAdr').value}\r\n`;
+    if (document.getElementById('editContactOrg').value) vcf += `ORG:${document.getElementById('editContactOrg').value}\r\n`;
+    if (document.getElementById('editContactTitle').value) vcf += `TITLE:${document.getElementById('editContactTitle').value}\r\n`;
+    if (document.getElementById('editContactUrl').value) vcf += `URL:${document.getElementById('editContactUrl').value}\r\n`;
+    if (document.getElementById('editContactBday').value) vcf += `BDAY:${document.getElementById('editContactBday').value}\r\n`;
+    if (document.getElementById('editContactNote').value) vcf += `NOTE:${document.getElementById('editContactNote').value}\r\n`;
     vcf += "END:VCARD\r\n";
     
     let blob = new Blob([vcf], {type: "text/vcard"});
     let urlObj = URL.createObjectURL(blob);
     let a = document.createElement('a');
     a.href = urlObj;
-    let safeName = fn.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-    a.download = safeName + ".vcf";
+    a.download = fn.replace(/[^a-z0-9]/gi, '_').toLowerCase() + ".vcf";
     a.click();
     URL.revokeObjectURL(urlObj);
 });
@@ -425,11 +450,9 @@ window.openContactEditor = function(idx) {
     let dl = document.getElementById('availableUsernames');
     dl.innerHTML = '';
     
-    // Filter available usernames (don't show ones already assigned to *other* contacts)
     people.forEach(p => {
         if (p && !p.startsWith("Person ")) {
-            let isUsed = contacts.some((otherC, otherIdx) => otherIdx !== idx && otherC.username === p);
-            if (!isUsed) {
+            if (!contacts.some((otherC, otherIdx) => otherIdx !== idx && otherC.username === p)) {
                 dl.innerHTML += `<option value="${p}">`;
             }
         }
@@ -459,8 +482,7 @@ document.getElementById('btnSaveSingleContact')?.addEventListener('click', async
     let oldUsername = document.getElementById('editContactIdx').dataset.oldUsername || '';
     
     if (newUsername !== "") {
-        let isUsed = contacts.some((otherC, otherIdx) => otherIdx !== idx && otherC.username === newUsername);
-        if (isUsed) {
+        if (contacts.some((otherC, otherIdx) => otherIdx !== idx && otherC.username === newUsername)) {
             alert("This username is already linked to another contact. Unique links are required.");
             return;
         }
@@ -477,27 +499,17 @@ document.getElementById('btnSaveSingleContact')?.addEventListener('click', async
     c.url = document.getElementById('editContactUrl').value;
     c.bday = document.getElementById('editContactBday').value;
     c.note = document.getElementById('editContactNote').value;
-    
-    delete c.fullname; // Cleanup legacy property if present
+    delete c.fullname; 
     
     if (newUsername !== oldUsername && newUsername !== "") {
-        let payload = oldUsername ? `${oldUsername}|${newUsername}` : newUsername;
         try {
-            await fetch(`${window.location.origin}/api/user`, {
-                method: 'PUT',
-                headers: { 'Authorization': getAuthHeader() },
-                body: payload
-            });
+            await fetch(`${window.location.origin}/api/user`, { method: 'PUT', headers: { 'Authorization': getAuthHeader() }, body: oldUsername ? `${oldUsername}|${newUsername}` : newUsername });
             let pIdx = people.indexOf(oldUsername);
-            if (oldUsername && pIdx !== -1) {
-                people[pIdx] = newUsername;
-            } else if (people.indexOf(newUsername) === -1) {
-                people.push(newUsername);
-            }
+            if (oldUsername && pIdx !== -1) people[pIdx] = newUsername;
+            else if (people.indexOf(newUsername) === -1) people.push(newUsername);
             putPeopleToCalDAV();
         } catch(e) {}
     }
-    
     document.getElementById('contactEditorModal').style.display = 'none';
     renderContactsList();
 });
@@ -513,11 +525,7 @@ function renderContactsList() {
         if (filterText && !(c.username || '').toLowerCase().includes(filterText) && !displayFn.toLowerCase().includes(filterText)) return;
         
         let div = document.createElement('div');
-        div.style.display = 'flex';
-        div.style.justifyContent = 'space-between';
-        div.style.alignItems = 'center';
-        div.style.padding = '8px 12px';
-        div.style.borderBottom = '1px solid #dadce0';
+        div.style.display = 'flex'; div.style.justifyContent = 'space-between'; div.style.alignItems = 'center'; div.style.padding = '8px 12px'; div.style.borderBottom = '1px solid #dadce0';
         
         let linkText = c.username ? ` (Linked: ${c.username})` : '';
         div.innerHTML = `
@@ -546,28 +554,27 @@ document.getElementById('btnAddContact')?.addEventListener('click', () => {
 });
 
 document.getElementById('btnSaveContacts')?.addEventListener('click', async () => {
-    await fetch(`${window.location.origin}/api/contacts`, {
-        method: 'PUT',
-        headers: { 'Authorization': getAuthHeader(), 'Content-Type': 'application/json' },
-        body: JSON.stringify(contacts)
-    });
+    await fetch(`${window.location.origin}/api/contacts`, { method: 'PUT', headers: { 'Authorization': getAuthHeader(), 'Content-Type': 'application/json' }, body: JSON.stringify(contacts) });
     document.getElementById('contactsModal').style.display = 'none';
+    populateTempFilter();
     render();
 });
 
 function renderTimeline() {
     if (!gridBg || !timelineLabels || !headerRow) return;
     
+    let activeVisiblePeople = getEffectiveVisiblePeople();
     let myIdx = people.indexOf(currentUser);
-    if (myIdx !== -1 && !visiblePeopleIndices.includes(myIdx)) {
-        visiblePeopleIndices.push(myIdx);
-    }
+    if (myIdx !== -1 && !visiblePeopleIndices.includes(myIdx)) visiblePeopleIndices.push(myIdx);
 
     let cols = getColCount();
-    let activeCols = isPeopleView() ? visiblePeopleIndices.length : cols;
+    let activeCols = isPeopleView() ? activeVisiblePeople.length : cols;
     if (activeCols === 0) activeCols = 1;
     
-    updateDateTitle(currentDate.toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric' }));
+    let viewStart = new Date(currentDate);
+    if (viewMode === 3) viewStart.setDate(viewStart.getDate() - viewStart.getDay());
+    
+    updateDateTitle(viewStart.toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric' }));
     
     headerRow.innerHTML = '';
     for(let i=0; i<activeCols; i++) {
@@ -575,7 +582,7 @@ function renderTimeline() {
         div.className = 'col-header';
         
         if (isPeopleView()) {
-            let pIdx = visiblePeopleIndices[i];
+            let pIdx = activeVisiblePeople[i];
             let shortName = people[pIdx] || `Person ${pIdx + 1}`;
             let contactMatch = contacts.find(c => c.username === shortName);
             div.innerText = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : shortName;
@@ -591,31 +598,19 @@ function renderTimeline() {
                 input.onblur = input.onkeydown = async (ev) => {
                     if (ev.type === 'keydown' && ev.key !== 'Enter') return;
                     input.onblur = null; input.onkeydown = null;
-                    
                     let oldName = people[pIdx] || "";
                     let newName = input.value.trim() || `Person ${pIdx + 1}`;
-                    while (people.length <= pIdx) {
-                        people.push(`Person ${people.length + 1}`);
-                    }
+                    while (people.length <= pIdx) people.push(`Person ${people.length + 1}`);
                     people[pIdx] = newName;
                     putPeopleToCalDAV();
-                    
                     if (newName !== oldName) {
-                        try {
-                            let payload = oldName ? `${oldName}|${newName}` : newName;
-                            await fetch(`${window.location.origin}/api/user`, {
-                                method: 'PUT',
-                                headers: { 'Authorization': getAuthHeader() },
-                                body: payload
-                            });
-                        } catch(e) {}
+                        try { await fetch(`${window.location.origin}/api/user`, { method: 'PUT', headers: { 'Authorization': getAuthHeader() }, body: oldName ? `${oldName}|${newName}` : newName }); } catch(e) {}
                     }
-                    
                     render();
                 };
             };
         } else {
-            let d = new Date(currentDate);
+            let d = new Date(viewStart);
             d.setDate(d.getDate() + i);
             div.innerText = d.toLocaleDateString(undefined, { weekday: 'short', month: 'numeric', day: 'numeric' });
         }
@@ -646,24 +641,20 @@ function renderTimeline() {
 
     displayEvents.forEach(ev => {
         if (!isPeopleView() && viewMode <= 3) {
-            if (myIdx !== -1 && ev.personIdx !== myIdx && visiblePeopleIndices.length > 0 && !visiblePeopleIndices.includes(ev.personIdx)) {
-                return;
-            }
+            if (myIdx !== -1 && ev.personIdx !== myIdx && activeVisiblePeople.length > 0 && !activeVisiblePeople.includes(ev.personIdx)) return;
         } else if (isPeopleView()) {
-            if (visiblePeopleIndices.length > 0 && !visiblePeopleIndices.includes(ev.personIdx)) {
-                return;
-            }
+            if (activeVisiblePeople.length > 0 && !activeVisiblePeople.includes(ev.personIdx)) return;
         }
 
         let colIdx = -1;
         if (isPeopleView()) {
             if (ev.date === formatDate(currentDate)) {
-                let dispIdx = visiblePeopleIndices.indexOf(ev.personIdx);
+                let dispIdx = activeVisiblePeople.indexOf(ev.personIdx);
                 if (dispIdx !== -1) colIdx = dispIdx;
             }
         } else {
             let evDate = new Date(ev.date.replace(/\//g, '-') + 'T12:00:00');
-            let diffDays = Math.round((evDate.getTime() - new Date(currentDate.getFullYear(), currentDate.getMonth(), currentDate.getDate(), 12, 0, 0).getTime()) / 86400000);
+            let diffDays = Math.round((evDate.getTime() - new Date(viewStart.getFullYear(), viewStart.getMonth(), viewStart.getDate(), 12, 0, 0).getTime()) / 86400000);
             if (diffDays >= 0 && diffDays < cols) colIdx = diffDays;
         }
 
@@ -686,22 +677,18 @@ function renderTimeline() {
             
             card.ondblclick = (e) => {
                 e.stopPropagation(); 
+                if (!isEditMode()) return;
                 if (!canEdit(ev)) { alert("You do not have permission to edit this event."); return; }
                 
                 window.isEditing = true;
                 isDragging = false;
                 
                 let titleDiv = card.querySelector('.event-title') || card;
-                let currentTitle = ev.title;
-                
                 let input = document.createElement('input');
                 input.type = 'text';
-                input.value = currentTitle;
-                input.style.width = '100%';
-                input.style.color = '#000';
-                input.style.pointerEvents = 'auto'; 
-                input.onmousedown = (e) => e.stopPropagation();
-                input.ontouchstart = (e) => e.stopPropagation();
+                input.value = ev.title;
+                input.style.width = '100%'; input.style.color = '#000'; input.style.pointerEvents = 'auto'; 
+                input.onmousedown = (e) => e.stopPropagation(); input.ontouchstart = (e) => e.stopPropagation();
                 
                 titleDiv.innerHTML = '';
                 titleDiv.appendChild(input);
@@ -732,26 +719,22 @@ function renderTimeline() {
 
 function renderMonth() {
     if (!gridBg || !headerRow || !timelineLabels) return;
+    let activeVisiblePeople = getEffectiveVisiblePeople();
     
     updateDateTitle(currentDate.toLocaleDateString(undefined, { month: 'long', year: 'numeric' }));
     headerRow.innerHTML = '';
     const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     days.forEach(d => {
         let div = document.createElement('div');
-        div.className = 'col-header';
-        div.style.flex = '1';
-        div.style.textAlign = 'center';
-        div.innerText = d;
+        div.className = 'col-header'; div.style.flex = '1'; div.style.textAlign = 'center'; div.innerText = d;
         headerRow.appendChild(div);
     });
 
     timelineLabels.innerHTML = '';
-    gridBg.style.background = 'none';
-    gridBg.innerHTML = '';
+    gridBg.style.background = 'none'; gridBg.innerHTML = '';
     if (eventsLayer) eventsLayer.innerHTML = '';
     
-    let grid = document.createElement('div');
-    grid.className = 'month-grid';
+    let grid = document.createElement('div'); grid.className = 'month-grid';
     
     let y = currentDate.getFullYear();
     let m = currentDate.getMonth();
@@ -764,17 +747,12 @@ function renderMonth() {
 
     for (let row = 0; row < 6; row++) {
         for (let col = 0; col < 7; col++) {
-            let cell = document.createElement('div');
-            cell.className = 'month-cell';
-            
+            let cell = document.createElement('div'); cell.className = 'month-cell';
             let dayNum = cellCount - firstDay + 1;
-            let cellDateStr;
-            let displayNum;
-            let isOtherMonth = false;
+            let cellDateStr, displayNum, isOtherMonth = false;
 
             if (dayNum <= 0) {
-                let pD = new Date(y, m, 0); 
-                displayNum = pD.getDate() + dayNum;
+                displayNum = new Date(y, m, 0).getDate() + dayNum;
                 cellDateStr = formatDate(new Date(y, m - 1, displayNum));
                 isOtherMonth = true;
             } else if (dayNum > daysInMonth) {
@@ -793,46 +771,37 @@ function renderMonth() {
             let validEvents = displayEvents.filter(e => {
                 if (e.date !== cellDateStr) return false;
                 if (myIdx !== -1 && e.personIdx === myIdx) return true;
-                if (visiblePeopleIndices.length > 0 && !visiblePeopleIndices.includes(e.personIdx)) return false;
+                if (activeVisiblePeople.length > 0 && !activeVisiblePeople.includes(e.personIdx)) return false;
                 return true;
             });
             
             validEvents.forEach(ev => {
+                let shortName = people[ev.personIdx] || "";
+                let contactMatch = contacts.find(c => c.username === shortName);
+                let pDisp = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : shortName;
+                
                 let evDiv = document.createElement('div');
-                evDiv.className = 'month-event';
-                evDiv.style.backgroundColor = ev.color;
-                evDiv.innerText = ev.title;
-                evDiv.dataset.id = ev.id;
+                evDiv.className = 'month-event'; evDiv.style.backgroundColor = ev.color; evDiv.innerText = ev.title + (pDisp ? " - " + pDisp : ""); evDiv.dataset.id = ev.id;
                 if(selectedEventId === ev.id) evDiv.style.outline = "2px solid #000";
                 
                 evDiv.onclick = (e) => { 
-                    e.stopPropagation(); 
-                    selectedEventId = ev.id; 
+                    e.stopPropagation(); selectedEventId = ev.id; 
                     document.querySelectorAll('.month-event').forEach(el => el.style.outline = 'none');
                     evDiv.style.outline = "2px solid #000"; 
                 };
                 
-                evDiv.addEventListener('mousedown', startMonthDrag);
-                evDiv.addEventListener('touchstart', startMonthDrag, {passive: false});
-                
+                evDiv.addEventListener('mousedown', startMonthDrag); evDiv.addEventListener('touchstart', startMonthDrag, {passive: false});
                 evDiv.ondblclick = (e) => {
                     e.stopPropagation();
+                    if (!isEditMode()) return;
                     if (!canEdit(ev)) { alert("You do not have permission to edit this event."); return; }
-                    
                     window.isEditing = true;
                     
-                    let input = document.createElement('input');
-                    input.type = 'text';
-                    input.value = ev.title;
-                    input.style.width = '100%';
-                    input.style.color = '#000';
-                    input.style.pointerEvents = 'auto'; 
-                    input.onmousedown = (e) => e.stopPropagation();
-                    input.ontouchstart = (e) => e.stopPropagation();
+                    let input = document.createElement('input'); input.type = 'text'; input.value = ev.title;
+                    input.style.width = '100%'; input.style.color = '#000'; input.style.pointerEvents = 'auto'; 
+                    input.onmousedown = (e) => e.stopPropagation(); input.ontouchstart = (e) => e.stopPropagation();
                     
-                    evDiv.innerHTML = '';
-                    evDiv.appendChild(input);
-                    input.focus();
+                    evDiv.innerHTML = ''; evDiv.appendChild(input); input.focus();
                     
                     input.onblur = input.onkeydown = (keyEv) => {
                         if (keyEv.type === 'keydown' && keyEv.key !== 'Enter') return;
@@ -852,32 +821,20 @@ function renderMonth() {
             });
             
             cell.ondblclick = () => {
+                if (!isEditMode()) return;
                 let targetIdx = people.indexOf(currentUser);
                 if (targetIdx === -1 && currentUser) {
-                    targetIdx = people.length;
-                    people.push(currentUser);
-                    putPeopleToCalDAV();
-                } else if (targetIdx === -1) {
-                    targetIdx = 0; 
-                }
+                    targetIdx = people.length; people.push(currentUser); putPeopleToCalDAV();
+                } else if (targetIdx === -1) { targetIdx = 0; }
                 
                 let newEv = { 
-                    id: Date.now().toString(), 
-                    title: "New Event", 
-                    startMin: 540, 
-                    duration: 60, 
-                    color: colors[events.length % colors.length], 
-                    date: cellDateStr, 
-                    personIdx: targetIdx 
+                    id: Date.now().toString(), title: document.getElementById('comboDefaultEvent')?.value || "WORKING", 
+                    startMin: 540, duration: 60, color: colors[targetIdx % colors.length], date: cellDateStr, personIdx: targetIdx 
                 };
-                events.push(newEv);
-                putEventToCalDAV(newEv);
-                render();
+                events.push(newEv); putEventToCalDAV(newEv); render();
             };
             
-            if (isOtherMonth) {
-                cell.style.backgroundColor = '#f1f3f4';
-            }
+            if (isOtherMonth) cell.style.backgroundColor = '#f1f3f4';
             grid.appendChild(cell);
             cellCount++;
         }
@@ -886,62 +843,206 @@ function renderMonth() {
 }
 
 function startMonthDrag(e) {
+    if (!isEditMode()) return;
     e.stopPropagation();
     if (window.isEditing) return;
     selectedEventId = this.dataset.id;
     let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
     monthDragEv = events.find(x => x.id === realId);
     
-    if (!monthDragEv || !canEdit(monthDragEv)) {
-        monthDragEv = null;
-        return;
-    }
-    
-    isMonthDragging = true;
-    hasMoved = false;
+    if (!monthDragEv || !canEdit(monthDragEv)) { monthDragEv = null; return; }
+    isMonthDragging = true; hasMoved = false;
     document.querySelectorAll('.month-event').forEach(el => el.style.outline = 'none');
     this.style.outline = "2px solid #000";
 }
 
 function renderUpcoming() {
     if (!gridBg || !headerRow || !timelineLabels) return;
-    updateDateTitle("Upcoming Schedule");
-    headerRow.innerHTML = '';
-    timelineLabels.innerHTML = '';
-    gridBg.style.background = 'none';
-    gridBg.innerHTML = '';
+    updateDateTitle("Events");
+    let activeVisiblePeople = getEffectiveVisiblePeople();
+    headerRow.innerHTML = ''; timelineLabels.innerHTML = '';
+    gridBg.style.background = 'none'; gridBg.innerHTML = '';
     if (eventsLayer) eventsLayer.innerHTML = '';
 
-    let container = document.createElement('div');
-    container.className = 'upcoming-list';
+    let container = document.createElement('div'); container.className = 'upcoming-list';
     
     let displayEvents = typeof unrollEvents === 'function' ? unrollEvents() : events;
     let myIdx = people.indexOf(currentUser);
     
     let validEvents = displayEvents.filter(e => {
         if (e.date < formatDate(new Date())) return false;
-        if (myIdx !== -1 && e.personIdx === myIdx) return true;
-        if (visiblePeopleIndices.length > 0 && !visiblePeopleIndices.includes(e.personIdx)) return false;
+        if (activeVisiblePeople.length > 0 && !activeVisiblePeople.includes(e.personIdx)) return false;
         return true;
     });
     
-    let sorted = validEvents.sort((a,b) => a.date.localeCompare(b.date) || a.startMin - b.startMin);
-    
-    sorted.forEach(ev => {
-        let card = document.createElement('div');
-        card.className = 'upcoming-card';
+    validEvents.sort((a,b) => a.date.localeCompare(b.date) || a.startMin - b.startMin).forEach(ev => {
+        let card = document.createElement('div'); card.className = 'upcoming-card';
         let shortName = people[ev.personIdx] || "";
         let contactMatch = contacts.find(c => c.username === shortName);
         let p = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : shortName;
         card.innerHTML = `
             <div class="upcoming-color" style="background:${ev.color}"></div>
             <div class="upcoming-details">
-                <h3>${ev.title}</h3>
-                <p>${ev.date} &nbsp;|&nbsp; ${minToTimeStr(ev.startMin)} - ${minToTimeStr(ev.startMin + ev.duration)} &nbsp;|&nbsp; ${p}</p>
+                <h3>${ev.title} - ${p}</h3>
+                <p>${ev.date} &nbsp;|&nbsp; ${minToTimeStr(ev.startMin)} - ${minToTimeStr(ev.startMin + ev.duration)}</p>
             </div>
         `;
         container.appendChild(card);
     });
+    gridBg.appendChild(container);
+}
+
+function renderScheduleTable() {
+    if (!gridBg || !headerRow || !timelineLabels) return;
+    
+    let viewStart = new Date(currentDate);
+    // Fixed: Now starts on Sunday by removing the extra + 1
+    viewStart.setDate(viewStart.getDate() - viewStart.getDay()); 
+
+    updateDateTitle("Schedule");
+    headerRow.innerHTML = '';
+    timelineLabels.innerHTML = '';
+    gridBg.style.background = 'none';
+    gridBg.innerHTML = '';
+    if (eventsLayer) eventsLayer.innerHTML = '';
+
+    let table = document.createElement('table');
+    table.style.width = '100%';
+    table.style.borderCollapse = 'collapse';
+    table.style.fontSize = '12px';
+    table.style.textAlign = 'left';
+    table.style.userSelect = 'text';
+    table.style.webkitUserSelect = 'text';
+    table.style.tableLayout = 'fixed';
+
+    let thead = document.createElement('thead');
+    let hr = document.createElement('tr');
+    hr.style.borderBottom = '2px solid #dadce0';
+    hr.style.backgroundColor = '#f8f9fa';
+    
+    let th = document.createElement('th');
+    th.innerText = 'Worker';
+    th.style.padding = '6px';
+    th.style.width = '12%';
+    th.style.userSelect = 'text';
+    hr.appendChild(th);
+
+    let thHours = document.createElement('th');
+    thHours.innerText = 'Hours';
+    thHours.style.padding = '6px';
+    thHours.style.width = '6%';
+    thHours.style.userSelect = 'text';
+    hr.appendChild(thHours);
+
+    for (let i = 0; i < 7; i++) {
+        let d = new Date(viewStart);
+        d.setDate(d.getDate() + i);
+        let thd = document.createElement('th');
+        thd.innerText = d.toLocaleDateString(undefined, { weekday: 'short', month: 'numeric', day: 'numeric' });
+        thd.style.padding = '6px';
+        thd.style.borderLeft = '1px solid #dadce0';
+        thd.style.userSelect = 'text';
+        hr.appendChild(thd);
+    }
+    thead.appendChild(hr);
+    table.appendChild(thead);
+
+    let tbody = document.createElement('tbody');
+    let activeVisiblePeople = getEffectiveVisiblePeople();
+    let displayEvents = typeof unrollEvents === 'function' ? unrollEvents() : events;
+    
+    let gRestStr = document.getElementById('globalSchedRest')?.value;
+    let gRestMins = (gRestStr && gRestStr.toLowerCase() !== 'clear') ? parseFloat(gRestStr) * 60 : 0;
+    if (isNaN(gRestMins)) gRestMins = 0;
+    
+    activeVisiblePeople.forEach(pIdx => {
+        let tr = document.createElement('tr');
+        tr.style.borderBottom = '1px solid #e0e0e0';
+        
+        let tdName = document.createElement('td');
+        tdName.style.padding = '6px';
+        tdName.style.userSelect = 'text';
+        tdName.style.fontWeight = 'bold';
+        tdName.style.color = '#3c4043';
+        let shortName = people[pIdx] || `Person ${pIdx + 1}`;
+        let contactMatch = contacts.find(c => c.username === shortName);
+        tdName.innerText = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : shortName;
+        tr.appendChild(tdName);
+
+        let uRestMins = gRestMins;
+        if (schedUserData[pIdx] && schedUserData[pIdx].r && schedUserData[pIdx].r.toLowerCase() !== 'clear') {
+            uRestMins = parseFloat(schedUserData[pIdx].r) * 60;
+        }
+
+        let totalPaidMins = 0;
+        for (let i = 0; i < 7; i++) {
+            let d = new Date(viewStart);
+            d.setDate(d.getDate() + i);
+            let dayEvs = displayEvents.filter(e => e.date === formatDate(d) && e.personIdx === pIdx);
+            
+            let dailyWorkMins = 0;
+            dayEvs.forEach(e => {
+                if (!/\bOFF\b/.test((e.title || "").toUpperCase())) {
+                    dailyWorkMins += e.duration;
+                }
+            });
+            
+            if (dailyWorkMins > uRestMins) {
+                totalPaidMins += (dailyWorkMins - uRestMins);
+            } else {
+                totalPaidMins += dailyWorkMins;
+            }
+        }
+        
+        let tdHours = document.createElement('td');
+        tdHours.style.padding = '6px';
+        tdHours.style.userSelect = 'text';
+        tdHours.style.fontWeight = 'bold';
+        tdHours.style.color = '#3c4043';
+        tdHours.innerText = (totalPaidMins / 60).toFixed(1) + 'h';
+        tr.appendChild(tdHours);
+
+        for (let i = 0; i < 7; i++) {
+            let d = new Date(viewStart);
+            d.setDate(d.getDate() + i);
+            let dStr = formatDate(d);
+            
+            let tdDay = document.createElement('td');
+            tdDay.style.padding = '4px';
+            tdDay.style.borderLeft = '1px solid #e0e0e0';
+            tdDay.style.verticalAlign = 'top';
+            tdDay.style.userSelect = 'text';
+            
+            let dayEvs = displayEvents.filter(e => e.date === dStr && e.personIdx === pIdx);
+            dayEvs.sort((a,b) => a.startMin - b.startMin);
+            
+            let html = dayEvs.map(e => {
+                let isOff = (e.title || "").toUpperCase().includes("OFF");
+                
+                let hrs = e.duration / 60;
+                let hrsStr = Number.isInteger(hrs) ? hrs : hrs.toFixed(1);
+                let displayTitle = `${e.title} - ${hrsStr}h`;
+                
+                let timeStr = `${minToTimeStr(e.startMin)} - ${minToTimeStr(e.startMin + e.duration)}`;
+                let content = isOff ? `<span style="font-weight:bold; user-select:text;">${displayTitle}</span>` : `<span style="font-weight:bold; user-select:text;">${displayTitle}</span><br><span style="user-select:text;">${timeStr}</span>`;
+                return `<div style="background-color:${e.color}; color:#fff; border-radius:4px; padding:4px 6px; margin-bottom:4px; font-size:11px; line-height:1.3; box-shadow:0 1px 2px rgba(0,0,0,0.15); user-select:text; -webkit-user-select:text;">${content}</div>`;
+            }).join('');
+            
+            tdDay.innerHTML = html;
+            tr.appendChild(tdDay);
+        }
+        tbody.appendChild(tr);
+    });
+    
+    table.appendChild(tbody);
+    let container = document.createElement('div');
+    container.style.padding = '10px';
+    container.style.overflowY = 'auto';
+    container.style.height = '100%';
+    container.style.width = '100%';
+    container.style.userSelect = 'text';
+    container.style.webkitUserSelect = 'text';
+    container.appendChild(table);
     
     gridBg.appendChild(container);
 }
@@ -949,38 +1050,31 @@ function renderUpcoming() {
 function render() {
     if (viewMode === 6) renderMonth();
     else if (viewMode === 7) renderUpcoming();
+    else if (viewMode === 8) renderScheduleTable();
     else renderTimeline();
 }
 
-window.addEventListener('resize', () => {
-    // Prevent layout thrashing when the mobile keyboard changes the viewport height
-    if (window.isEditing) return; 
-    
-    render();
-    updateLayout();
-});
+window.addEventListener('resize', () => { if (!window.isEditing) { render(); updateLayout(); } });
 
 function handleDrag(e) {
+    if (!isEditMode()) return;
     if (e.target.classList.contains('resize-handle') || e.target.tagName === 'INPUT') return;
     if (window.isEditing) return;
     
     selectedEventId = e.currentTarget.dataset.id;
     let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
     activeEv = events.find(ev => ev.id === realId);
-    if (!activeEv) return;
-    
-    if (!canEdit(activeEv)) {
-        activeEv = null;
-        return;
-    }
+    if (!activeEv || !canEdit(activeEv)) { activeEv = null; return; }
     
     originalDateStr = activeEv.date;
     
     if (e.ctrlKey) {
+        // Clone on Ctrl+Drag and save to CalDAV immediately
         let clonedEv = { ...activeEv, id: Date.now().toString() };
         events.push(clonedEv);
-        activeEv = clonedEv;
-        selectedEventId = clonedEv.id;
+        putEventToCalDAV(clonedEv);
+        activeEv = clonedEv; 
+        selectedEventId = clonedEv.id; 
         render(); 
     } else {
         document.querySelectorAll('.event-card').forEach(c => c.classList.remove('selected'));
@@ -988,15 +1082,14 @@ function handleDrag(e) {
     }
 
     originalStartMin = activeEv.startMin;
-    startMouseY = getClientY(e);
+    startMouseY = getClientY(e); 
     startMouseX = getClientX(e);
-    isDragging = true;
+    isDragging = true; 
     hasMoved = false;
-    
     activeCard = document.querySelector(`.event-card[data-id='${selectedEventId}']`);
 }
-
 function handleResize(e) {
+    if (!isEditMode()) return;
     e.stopPropagation();
     if (window.isEditing) return;
     activeCard = e.target.parentElement;
@@ -1004,15 +1097,9 @@ function handleResize(e) {
     let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
     activeEv = events.find(ev => ev.id === realId);
     
-    if (!activeEv || !canEdit(activeEv)) {
-        activeEv = null;
-        return;
-    }
-    
-    isResizing = true;
-    hasMoved = true;
-    startMouseY = getClientY(e);
-    originalDuration = activeEv.duration;
+    if (!activeEv || !canEdit(activeEv)) { activeEv = null; return; }
+    isResizing = true; hasMoved = true;
+    startMouseY = getClientY(e); originalDuration = activeEv.duration;
 }
 
 function handleMove(e) {
@@ -1021,17 +1108,12 @@ function handleMove(e) {
         hasMoved = true;
         let target = document.elementFromPoint(getClientX(e), getClientY(e));
         document.querySelectorAll('.month-cell').forEach(c => c.style.backgroundColor = c.dataset.other === 'true' ? '#f1f3f4' : '');
-        if (target && target.closest('.month-cell')) {
-            target.closest('.month-cell').style.backgroundColor = '#e8eaed';
-        }
+        if (target && target.closest('.month-cell')) target.closest('.month-cell').style.backgroundColor = '#e8eaed';
         return;
     }
 
     if (!activeCard || !activeEv) return;
-    
-    if (isDragging || isResizing) {
-        if (e.cancelable) e.preventDefault();
-    }
+    if (isDragging || isResizing) { if (e.cancelable) e.preventDefault(); }
     
     if (isDragging) {
         let deltaY = getClientY(e) - startMouseY;
@@ -1039,6 +1121,7 @@ function handleMove(e) {
         
         if (!hasMoved && Math.abs(deltaY) < 5 && Math.abs(deltaX) < 5) return;
         hasMoved = true;
+        let activeVisiblePeople = getEffectiveVisiblePeople();
 
         let deltaMins = Math.round(deltaY / zoom / 15) * 15; 
         let newMin = Math.max(0, Math.min(1440 - activeEv.duration, originalStartMin + deltaMins));
@@ -1048,26 +1131,28 @@ function handleMove(e) {
 
         let rect = gridBg.getBoundingClientRect();
         let cols = getColCount();
-        let activeCols = isPeopleView() ? visiblePeopleIndices.length : cols;
+        let activeCols = isPeopleView() ? activeVisiblePeople.length : cols;
         if (activeCols === 0) activeCols = 1;
         
         let xOffset = getClientX(e) - rect.left;
         let newColIdx = Math.max(0, Math.min(activeCols - 1, Math.floor(xOffset / (rect.width / activeCols))));
         
         if (isPeopleView()) {
-            let tgtIdx = visiblePeopleIndices[newColIdx];
-            if (!canEditAll && tgtIdx !== people.indexOf(currentUser)) {
-            } else {
+            let tgtIdx = activeVisiblePeople[newColIdx];
+            if (!canEditAll && tgtIdx !== people.indexOf(currentUser)) {} else {
                 activeEv.personIdx = tgtIdx;
+                activeEv.color = colors[tgtIdx % colors.length];
             }
         } else {
             let dt = new Date(currentDate.getFullYear(), currentDate.getMonth(), currentDate.getDate()); 
+            if (viewMode === 3) dt.setDate(dt.getDate() - dt.getDay());
             dt.setDate(dt.getDate() + newColIdx);
             activeEv.date = formatDate(dt);
         }
         
-        let displayCol = isPeopleView() ? visiblePeopleIndices.indexOf(activeEv.personIdx) : newColIdx;
+        let displayCol = isPeopleView() ? activeVisiblePeople.indexOf(activeEv.personIdx) : newColIdx;
         activeCard.style.left = `${(displayCol / activeCols) * 100}%`;
+        activeCard.style.backgroundColor = activeEv.color;
         
     } else if (isResizing) {
         let deltaY = getClientY(e) - startMouseY;
@@ -1082,51 +1167,37 @@ function handleMove(e) {
 function handleUp(e) {
     if (isMonthDragging && monthDragEv) {
         if (hasMoved) {
-            let clientX = e.changedTouches ? e.changedTouches[0].clientX : e.clientX;
-            let clientY = e.changedTouches ? e.changedTouches[0].clientY : e.clientY;
-            let target = document.elementFromPoint(clientX, clientY);
+            let target = document.elementFromPoint(e.changedTouches ? e.changedTouches[0].clientX : e.clientX, e.changedTouches ? e.changedTouches[0].clientY : e.clientY);
             let cell = target ? target.closest('.month-cell') : null;
             if (cell && cell.dataset.date && monthDragEv.date !== cell.dataset.date) {
                 let oldDateStr = monthDragEv.date;
                 monthDragEv.date = cell.dataset.date;
                 
-                if (getQuarter(oldDateStr) !== getQuarter(monthDragEv.date)) {
-                    let oldQ = getQuarter(oldDateStr);
-                    let oldQEvents = events.filter(e => getQuarter(e.date) === oldQ);
-                    if (oldQEvents.length === 0) {
-                        fetch(`${CALDAV_URL}${oldQ}.json`, { method: 'DELETE', headers: { 'Authorization': getAuthHeader() } });
-                    } else {
-                        fetch(`${CALDAV_URL}${oldQ}.json`, { method: 'PUT', headers: { 'Content-Type': 'application/json', 'Authorization': getAuthHeader() }, body: JSON.stringify(oldQEvents) });
-                    }
+                if (getStorageKey(oldDateStr) !== getStorageKey(monthDragEv.date)) {
+                    let oldKey = getStorageKey(oldDateStr);
+                    let oldEvents = events.filter(ev => getStorageKey(ev.date) === oldKey);
+                    if (oldEvents.length === 0) fetch(`${CALDAV_URL}${oldKey}.json`, { method: 'DELETE', headers: { 'Authorization': getAuthHeader() } });
+                    else fetch(`${CALDAV_URL}${oldKey}.json`, { method: 'PUT', headers: { 'Content-Type': 'application/json', 'Authorization': getAuthHeader() }, body: JSON.stringify(oldEvents) });
                 }
                 putEventToCalDAV(monthDragEv);
                 render();
             }
         }
-        isMonthDragging = false;
-        monthDragEv = null;
+        isMonthDragging = false; monthDragEv = null;
         document.querySelectorAll('.month-cell').forEach(c => c.style.backgroundColor = c.dataset.other === 'true' ? '#f1f3f4' : '');
         return;
     }
 
-    if ((isDragging || isResizing) && activeEv) {
-        if (hasMoved) {
-            if (originalDateStr && getQuarter(originalDateStr) !== getQuarter(activeEv.date)) {
-                let oldQ = getQuarter(originalDateStr);
-                let oldQEvents = events.filter(e => getQuarter(e.date) === oldQ);
-                if (oldQEvents.length === 0) {
-                    fetch(`${CALDAV_URL}${oldQ}.json`, { method: 'DELETE', headers: { 'Authorization': getAuthHeader() } });
-                } else {
-                    fetch(`${CALDAV_URL}${oldQ}.json`, { method: 'PUT', headers: { 'Content-Type': 'application/json', 'Authorization': getAuthHeader() }, body: JSON.stringify(oldQEvents) });
-                }
-            }
-            putEventToCalDAV(activeEv);
+    if ((isDragging || isResizing) && activeEv && hasMoved) {
+        if (originalDateStr && getStorageKey(originalDateStr) !== getStorageKey(activeEv.date)) {
+            let oldKey = getStorageKey(originalDateStr);
+            let oldEvents = events.filter(ev => getStorageKey(ev.date) === oldKey);
+            if (oldEvents.length === 0) fetch(`${CALDAV_URL}${oldKey}.json`, { method: 'DELETE', headers: { 'Authorization': getAuthHeader() } });
+            else fetch(`${CALDAV_URL}${oldKey}.json`, { method: 'PUT', headers: { 'Content-Type': 'application/json', 'Authorization': getAuthHeader() }, body: JSON.stringify(oldEvents) });
         }
+        putEventToCalDAV(activeEv);
     }
-    isDragging = false;
-    isResizing = false;
-    activeCard = null;
-    activeEv = null;
+    isDragging = false; isResizing = false; activeCard = null; activeEv = null;
 }
 
 window.addEventListener('mousemove', handleMove, {passive: false});
@@ -1137,41 +1208,34 @@ window.addEventListener('touchend', handleUp);
 if (gridBg) {
     gridBg.addEventListener('dblclick', e => {
         if (viewMode >= 6) return; 
-        let rect = gridBg.getBoundingClientRect();
+        if (!isEditMode()) return;
         
-        let y = getClientY(e) - rect.top;
-        let x = getClientX(e) - rect.left;
+        let rect = gridBg.getBoundingClientRect();
+        let y = getClientY(e) - rect.top; let x = getClientX(e) - rect.left;
+        let activeVisiblePeople = getEffectiveVisiblePeople();
         
         let stMin = Math.max(0, Math.min(1440 - 60, Math.floor(y / zoom / 30) * 30));
         let cols = getColCount();
-        let activeCols = isPeopleView() ? visiblePeopleIndices.length : cols;
+        let activeCols = isPeopleView() ? activeVisiblePeople.length : cols;
         if (activeCols === 0) activeCols = 1;
         
         let colIdx = Math.max(0, Math.min(activeCols - 1, Math.floor(x / (rect.width / activeCols))));
-        
         let dt = new Date(currentDate.getFullYear(), currentDate.getMonth(), currentDate.getDate());
+        if (viewMode === 3) dt.setDate(dt.getDate() - dt.getDay());
         if (!isPeopleView()) dt.setDate(dt.getDate() + colIdx);
         
-        let pIdx = isPeopleView() ? visiblePeopleIndices[colIdx] : people.indexOf(currentUser);
+        let pIdx = isPeopleView() ? activeVisiblePeople[colIdx] : people.indexOf(currentUser);
         if (pIdx === -1 || pIdx === undefined) {
             pIdx = people.indexOf(currentUser);
-            if (pIdx === -1 && currentUser) {
-                pIdx = people.length;
-                people.push(currentUser);
-                putPeopleToCalDAV();
-            } else if (pIdx === -1) {
-                pIdx = 0;
-            }
+            if (pIdx === -1 && currentUser) { pIdx = people.length; people.push(currentUser); putPeopleToCalDAV(); }
+            else if (pIdx === -1) pIdx = 0;
         }
         
-        if (!canEditAll && pIdx !== people.indexOf(currentUser)) {
-            alert("You can only create events on your own schedule.");
-            return;
-        }
+        if (!canEditAll && pIdx !== people.indexOf(currentUser)) { alert("You can only create events on your own schedule."); return; }
         
         let newEv = {
-            id: Date.now().toString(), title: "New Event", startMin: stMin, duration: 60,
-            color: colors[events.length % colors.length], date: formatDate(dt), personIdx: pIdx
+            id: Date.now().toString(), title: document.getElementById('comboDefaultEvent')?.value || "WORKING", startMin: stMin, duration: 60,
+            color: colors[pIdx % colors.length], date: formatDate(dt), personIdx: pIdx
         };
         events.push(newEv);
         putEventToCalDAV(newEv);
@@ -1195,107 +1259,83 @@ document.getElementById('btnNext')?.addEventListener('click', () => {
     else currentDate.setDate(currentDate.getDate() + (viewMode === 1 ? 1 : (viewMode === 2 ? 4 : 7))); 
     render(); 
 });
+document.getElementById('btnPrevDay')?.addEventListener('click', () => { 
+    currentDate.setDate(currentDate.getDate() - 1); 
+    render(); 
+});
+document.getElementById('btnNextDay')?.addEventListener('click', () => { 
+    currentDate.setDate(currentDate.getDate() + 1); 
+    render(); 
+});
 document.getElementById('btnZoomIn')?.addEventListener('click', () => { zoom = Math.min(2.5, zoom + 0.2); render(); });
 document.getElementById('btnZoomOut')?.addEventListener('click', () => { zoom = Math.max(0.6, zoom - 0.2); render(); });
 document.getElementById('btnSync')?.addEventListener('click', downloadUpdates);
 
+
 document.getElementById('btnCopy')?.addEventListener('click', () => {
+    if (!isEditMode()) { alert("Please enable Edit Mode to duplicate events."); return; }
     if (selectedEventId) {
         let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
         let ev = events.find(e => e.id === realId);
         if (ev && canEdit(ev)) {
-            let newEv = { ...ev, id: Date.now().toString(), startMin: Math.min(1440 - ev.duration, ev.startMin + 30) };
-            events.push(newEv);
-            putEventToCalDAV(newEv);
-            selectedEventId = newEv.id;
+            // Clone in the exact same spot (no +30 offset)
+            let newEv = { ...ev, id: Date.now().toString(), startMin: ev.startMin };
+            events.push(newEv); 
+            putEventToCalDAV(newEv); 
+            selectedEventId = newEv.id; 
             render();
-        } else { alert("You do not have permission to duplicate this event."); }
+        } else alert("You do not have permission to duplicate this event.");
     }
 });
 
 document.getElementById('btnDelete')?.addEventListener('click', () => {
+    if (!isEditMode()) { alert("Please enable Edit Mode to delete events."); return; }
     if (selectedEventId) {
         let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
         let evToDel = events.find(e => e.id === realId);
         if (evToDel && !canEdit(evToDel)) { alert("You do not have permission to delete this event."); return; }
-        
         events = events.filter(e => e.id !== realId);
         if (evToDel) deleteEventFromCalDAV(evToDel);
-        selectedEventId = null;
-        render();
+        selectedEventId = null; render();
     }
 });
 
 document.getElementById('btnFilterPeople')?.addEventListener('click', () => {
-    const list = document.getElementById('peopleFilterList');
-    list.innerHTML = '';
+    const list = document.getElementById('peopleFilterList'); list.innerHTML = '';
     people.forEach((p, idx) => {
         if (!p) return;
         let div = document.createElement('div');
-        let chk = document.createElement('input');
-        chk.type = 'checkbox';
-        chk.value = idx;
-        chk.checked = visiblePeopleIndices.includes(idx);
-        chk.id = 'chk_person_' + idx;
-        
-        let lbl = document.createElement('label');
-        lbl.htmlFor = 'chk_person_' + idx;
-        lbl.innerText = p;
-        
-        div.appendChild(chk);
-        div.appendChild(lbl);
-        list.appendChild(div);
+        let chk = document.createElement('input'); chk.type = 'checkbox'; chk.value = idx; chk.checked = visiblePeopleIndices.includes(idx); chk.id = 'chk_person_' + idx;
+        let lbl = document.createElement('label'); lbl.htmlFor = 'chk_person_' + idx; lbl.innerText = p;
+        div.appendChild(chk); div.appendChild(lbl); list.appendChild(div);
     });
     document.getElementById('peopleFilterModal').style.display = 'block';
 });
 
 document.getElementById('btnSavePeopleFilter')?.addEventListener('click', () => {
-    let checks = document.querySelectorAll('#peopleFilterList input[type="checkbox"]');
     visiblePeopleIndices = [];
-    checks.forEach(chk => {
-        if (chk.checked) visiblePeopleIndices.push(parseInt(chk.value));
-    });
-    
+    document.querySelectorAll('#peopleFilterList input[type="checkbox"]').forEach(chk => { if (chk.checked) visiblePeopleIndices.push(parseInt(chk.value)); });
     let myIdx = people.indexOf(currentUser);
-    if (myIdx !== -1 && !visiblePeopleIndices.includes(myIdx)) {
-        visiblePeopleIndices.push(myIdx);
-    }
-    
+    if (myIdx !== -1 && !visiblePeopleIndices.includes(myIdx)) visiblePeopleIndices.push(myIdx);
     saveVisiblePeople();
     document.getElementById('peopleFilterModal').style.display = 'none';
     render();
 });
 
 document.getElementById('btnCloneForUsers')?.addEventListener('click', () => {
-    if (!selectedEventId) {
-        alert("Please select an event first.");
-        return;
-    }
+    if (!isEditMode()) { alert("Please enable Edit Mode to clone events."); return; }
+    if (!selectedEventId) { alert("Please select an event first."); return; }
     let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
     let ev = events.find(e => e.id === realId);
+    if (!ev || !canEdit(ev)) { alert("You do not have permission to clone this event."); return; }
     
-    if (!ev || !canEdit(ev)) {
-        alert("You do not have permission to clone this event.");
-        return;
-    }
-    
-    const list = document.getElementById('cloneUsersList');
-    list.innerHTML = '';
+    const list = document.getElementById('cloneUsersList'); list.innerHTML = '';
     people.forEach((p, idx) => {
         if (!p) return;
         let div = document.createElement('div');
-        let chk = document.createElement('input');
-        chk.type = 'checkbox';
-        chk.value = idx;
-        chk.id = 'chk_clone_person_' + idx;
-        
-        let lbl = document.createElement('label');
-        lbl.htmlFor = 'chk_clone_person_' + idx;
-        lbl.innerText = p;
-        
-        div.appendChild(chk);
-        div.appendChild(lbl);
-        list.appendChild(div);
+        let chk = document.createElement('input'); chk.type = 'checkbox'; chk.value = idx; chk.id = 'chk_clone_person_' + idx;
+        let lbl = document.createElement('label'); lbl.htmlFor = 'chk_clone_person_' + idx; lbl.innerText = p;
+        div.appendChild(chk); div.appendChild(lbl); list.appendChild(div);
     });
     document.getElementById('cloneUsersModal').style.display = 'block';
 });
@@ -1303,182 +1343,985 @@ document.getElementById('btnCloneForUsers')?.addEventListener('click', () => {
 document.getElementById('btnDoCloneUsers')?.addEventListener('click', () => {
     let realId = selectedEventId.includes('_r') ? selectedEventId.split('_r')[0] : selectedEventId;
     let ev = events.find(e => e.id === realId);
-    
     if (!ev) return;
     
     let checks = document.querySelectorAll('#cloneUsersList input[type="checkbox"]:checked');
-    if (checks.length === 0) {
-        alert("Please select at least one user.");
-        return;
-    }
+    if (checks.length === 0) { alert("Please select at least one user."); return; }
     
     checks.forEach(chk => {
         let targetPersonIdx = parseInt(chk.value);
-        let newEv = {
-            ...ev,
-            id: Date.now().toString() + Math.floor(Math.random() * 1000),
-            personIdx: targetPersonIdx
-        };
-        events.push(newEv);
-        putEventToCalDAV(newEv);
+        let newEv = { ...ev, id: Date.now().toString() + Math.floor(Math.random() * 1000), personIdx: targetPersonIdx, color: colors[targetPersonIdx % colors.length] };
+        events.push(newEv); putEventToCalDAV(newEv);
     });
-    
     document.getElementById('cloneUsersModal').style.display = 'none';
     render();
 });
 
 document.getElementById('btnPrint')?.addEventListener('click', () => {
-    if (!window.jspdf) {
-        alert("jsPDF library not loaded. Ensure your jspdf.umd.min.js file is downloaded and placed in the same folder.");
+    if (!window.jspdf) { alert("jsPDF library not loaded. Ensure your jspdf.umd.min.js file is downloaded and placed in the same folder."); return; }
+    const { jsPDF } = window.jspdf; const doc = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'letter' });
+    let w = 612, h = 792; 
+    let rPage = { left: 18, top: 18, right: w - 18, bottom: h - 18 };
+    let titleH = 45, subH = 25; let gridTop = rPage.top + titleH + subH; let gridH = rPage.bottom - gridTop;
+    let activeVisiblePeople = getEffectiveVisiblePeople();
+    let displayEvents = typeof unrollEvents === 'function' ? unrollEvents() : events;
+
+    doc.setFont("helvetica", "bold"); doc.setFontSize(18); doc.setTextColor(32, 33, 36);
+    if (lblDateTitle) doc.text(lblDateTitle.innerText, rPage.left, rPage.top + 18);
+    let viewDesc = document.getElementById('comboView').options[document.getElementById('comboView').selectedIndex].text;
+    doc.setFont("helvetica", "normal"); doc.setFontSize(11); doc.setTextColor(112, 117, 122); doc.text(`Calendar Profile: ${viewDesc}`, rPage.left, rPage.top + 34);
+
+    if (viewMode === 8) {
+        let viewStart = new Date(currentDate); 
+        viewStart.setDate(viewStart.getDate() - viewStart.getDay());
+        
+        let cols = [
+            { x: rPage.left, w: 70, t: "Worker" },
+            { x: rPage.left + 70, w: 35, t: "Hrs" },
+            { x: rPage.left + 105, w: 67, t: "Sun" },
+            { x: rPage.left + 172, w: 67, t: "Mon" },
+            { x: rPage.left + 239, w: 67, t: "Tue" },
+            { x: rPage.left + 306, w: 67, t: "Wed" },
+            { x: rPage.left + 373, w: 67, t: "Thu" },
+            { x: rPage.left + 440, w: 67, t: "Fri" },
+            { x: rPage.left + 507, w: 67, t: "Sat" }
+        ];
+        
+        doc.setFillColor(248, 249, 250);
+        doc.rect(rPage.left, gridTop, rPage.right - rPage.left, 20, "F");
+        doc.setFontSize(10); doc.setTextColor(0, 0, 0);
+        doc.setFont("helvetica", "bold");
+        
+        for (let i = 0; i < cols.length; i++) {
+            doc.text(cols[i].t, cols[i].x + 4, gridTop + 14);
+        }
+        
+        let y = gridTop + 20;
+        let gRestStr = document.getElementById('globalSchedRest')?.value;
+        let gRestMins = (gRestStr && gRestStr.toLowerCase() !== 'clear') ? parseFloat(gRestStr) * 60 : 0;
+        if (isNaN(gRestMins)) gRestMins = 0;
+        
+        activeVisiblePeople.forEach(pIdx => {
+            if (y > rPage.bottom - 40) {
+                doc.addPage();
+                y = rPage.top + 20;
+            }
+            
+            let shortName = people[pIdx] || `Person ${pIdx + 1}`;
+            let contactMatch = contacts.find(c => c.username === shortName);
+            let pName = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : shortName;
+            
+            let uRestMins = gRestMins;
+            if (schedUserData[pIdx] && schedUserData[pIdx].r && schedUserData[pIdx].r.toLowerCase() !== 'clear') {
+                uRestMins = parseFloat(schedUserData[pIdx].r) * 60;
+            }
+            
+            let totalPaidMins = 0;
+            let dayStrs = [];
+            for (let i = 0; i < 7; i++) {
+                let d = new Date(viewStart); d.setDate(d.getDate() + i);
+                let dayEvs = displayEvents.filter(e => e.date === formatDate(d) && e.personIdx === pIdx);
+                let dailyWorkMins = 0;
+                dayEvs.forEach(e => { if (!/\bOFF\b/.test((e.title || "").toUpperCase())) dailyWorkMins += e.duration; });
+                if (dailyWorkMins > uRestMins) totalPaidMins += (dailyWorkMins - uRestMins);
+                else totalPaidMins += dailyWorkMins;
+                
+                dayEvs.sort((a,b) => a.startMin - b.startMin);
+                let evLines = dayEvs.map(e => {
+                    if (/\bOFF\b/.test((e.title||"").toUpperCase())) return e.title;
+                    return `${minToTimeStr(e.startMin)}-${minToTimeStr(e.startMin+e.duration)}`;
+                });
+                dayStrs.push(evLines);
+            }
+            
+            let hrsStr = (totalPaidMins / 60).toFixed(1) + "h";
+            
+            let maxLines = 1;
+            dayStrs.forEach(lines => { if (lines.length > maxLines) maxLines = lines.length; });
+            let rowH = (maxLines * 12) + 8;
+            
+            doc.setDrawColor(204, 204, 204); doc.line(rPage.left, y, rPage.right, y);
+            
+            doc.setFontSize(9);
+            doc.setFont("helvetica", "bold");
+            doc.text(pName.substring(0, 15), cols[0].x + 4, y + 12);
+            doc.text(hrsStr, cols[1].x + 4, y + 12);
+            
+            doc.setFont("helvetica", "normal");
+            for (let i = 0; i < 7; i++) {
+                let lines = dayStrs[i];
+                for (let j = 0; j < lines.length; j++) {
+                    doc.text(lines[j], cols[i+2].x + 2, y + 12 + (j*12));
+                }
+            }
+            y += rowH;
+        });
+        
+        doc.setDrawColor(204, 204, 204); doc.line(rPage.left, y, rPage.right, y);
+        
+        let wkDate = new Date(viewStart); wkDate.setHours(0,0,0,0);
+        let weekNo = Math.ceil((((wkDate - new Date(wkDate.getFullYear(), 0, 1)) / 86400000) + new Date(wkDate.getFullYear(), 0, 1).getDay() + 1) / 7);
+        let pdfName = `${wkDate.getFullYear()}${String(wkDate.getMonth()+1).padStart(2,'0')}${String(wkDate.getDate()).padStart(2,'0')}_WK${weekNo}_Schedule.pdf`;
+        doc.save(pdfName);
         return;
     }
 
-    const { jsPDF } = window.jspdf;
-    const doc = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'letter' });
-    
-    let w = 612, h = 792; 
-    let rPage = { left: 18, top: 18, right: w - 18, bottom: h - 18 };
-    
-    let titleH = 45, subH = 25; 
-    let gridTop = rPage.top + titleH + subH;
-    let gridH = rPage.bottom - gridTop;
-    
-    let cols = getColCount();
-    let activeCols = isPeopleView() ? visiblePeopleIndices.length : cols;
-    if (activeCols === 0) activeCols = 1;
-    
-    let timeColW = 54;
-    let dayColW = (rPage.right - rPage.left - timeColW) / activeCols;
+    let cols = getColCount(); let activeCols = isPeopleView() ? activeVisiblePeople.length : cols; if (activeCols === 0) activeCols = 1;
+    let timeColW = 54; let dayColW = (rPage.right - rPage.left - timeColW) / activeCols;
+    let viewStart = new Date(currentDate); if (viewMode === 3) viewStart.setDate(viewStart.getDate() - viewStart.getDay());
 
-    doc.setFont("helvetica", "bold");
-    doc.setFontSize(18);
-    doc.setTextColor(32, 33, 36);
-    if (lblDateTitle) doc.text(lblDateTitle.innerText, rPage.left, rPage.top + 18);
-
-    let combo = document.getElementById('comboView');
-    let viewDesc = combo.options[combo.selectedIndex].text;
-    doc.setFont("helvetica", "normal");
-    doc.setFontSize(11);
-    doc.setTextColor(112, 117, 122);
-    doc.text(`Calendar Profile: ${viewDesc}`, rPage.left, rPage.top + 34);
-
-    doc.setFillColor(248, 249, 250);
-    doc.rect(rPage.left + timeColW, rPage.top + titleH, rPage.right - (rPage.left + timeColW), subH, "F");
-
+    doc.setFillColor(248, 249, 250); doc.rect(rPage.left + timeColW, rPage.top + titleH, rPage.right - (rPage.left + timeColW), subH, "F");
     doc.setLineWidth(0.5);
     
     for (let i = 0; i <= 24; i++) {
         let y = gridTop + (i * 60) * (gridH / 1440.0);
-        doc.setDrawColor(204, 204, 204);
-        doc.line(rPage.left + timeColW, y, rPage.right, y);
-        
+        doc.setDrawColor(204, 204, 204); doc.line(rPage.left + timeColW, y, rPage.right, y);
         if (i > 0 && i < 24) {
-            doc.setFont("helvetica", "normal");
-            doc.setFontSize(9);
-            doc.setTextColor(112, 117, 122);
+            doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(112, 117, 122);
             doc.text(minToTimeStr(i * 60), rPage.left + timeColW - 6, y + 3, { align: "right" });
         }
-        
         if (i < 24) {
             let hy = gridTop + (i * 60 + 30) * (gridH / 1440.0);
-            doc.setDrawColor(232, 232, 232); 
-            doc.line(rPage.left + timeColW, hy, rPage.right, hy);
+            doc.setDrawColor(232, 232, 232); doc.line(rPage.left + timeColW, hy, rPage.right, hy);
         }
     }
 
     doc.setDrawColor(204, 204, 204);
     for (let c = 0; c <= activeCols; c++) {
-        let x = rPage.left + timeColW + (c * dayColW);
-        doc.line(x, rPage.top + titleH, x, rPage.bottom);
-        
+        let x = rPage.left + timeColW + (c * dayColW); doc.line(x, rPage.top + titleH, x, rPage.bottom);
         if (c < activeCols) {
             let hdr = "";
             if (isPeopleView()) {
-                let shortName = people[visiblePeopleIndices[c]];
+                let shortName = people[activeVisiblePeople[c]];
                 let contactMatch = contacts.find(contact => contact.username === shortName);
                 hdr = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : shortName;
             } else {
-                let d = new Date(currentDate); 
-                d.setDate(d.getDate() + c); 
-                hdr = d.toLocaleDateString(undefined, {weekday:'short', month:'numeric', day:'numeric'});
+                let d = new Date(viewStart); d.setDate(d.getDate() + c); hdr = d.toLocaleDateString(undefined, {weekday:'short', month:'numeric', day:'numeric'});
             }
-            
-            doc.setFont("helvetica", "bold");
-            doc.setFontSize(11);
-            doc.setTextColor(60, 64, 67);
-            doc.text(hdr, x + (dayColW/2), rPage.top + titleH + 16, { align: "center" });
+            doc.setFont("helvetica", "bold"); doc.setFontSize(11); doc.setTextColor(60, 64, 67); doc.text(hdr, x + (dayColW/2), rPage.top + titleH + 16, { align: "center" });
         }
     }
 
-    let displayEvents = typeof unrollEvents === 'function' ? unrollEvents() : events;
     displayEvents.forEach(ev => {
         let colIdx = -1;
         if (isPeopleView()) { 
-            if (ev.date === formatDate(currentDate)) {
-                let dispIdx = visiblePeopleIndices.indexOf(ev.personIdx);
-                if (dispIdx !== -1) colIdx = dispIdx;
-            }
+            if (ev.date === formatDate(currentDate)) { let dispIdx = activeVisiblePeople.indexOf(ev.personIdx); if (dispIdx !== -1) colIdx = dispIdx; }
         } else {
             let evDate = new Date(ev.date.replace(/\//g, '-') + 'T12:00:00');
-            let diffDays = Math.round((evDate.getTime() - new Date(currentDate.getFullYear(), currentDate.getMonth(), currentDate.getDate(), 12, 0, 0).getTime()) / 86400000);
+            let diffDays = Math.round((evDate.getTime() - new Date(viewStart.getFullYear(), viewStart.getMonth(), viewStart.getDate(), 12, 0, 0).getTime()) / 86400000);
             if (diffDays >= 0 && diffDays < activeCols) colIdx = diffDays;
         }
 
         if (colIdx >= 0 && colIdx < activeCols) {
             let top = gridTop + (ev.startMin * (gridH / 1440.0));
             let bot = gridTop + ((ev.startMin + ev.duration) * (gridH / 1440.0));
-            let left = rPage.left + timeColW + (colIdx * dayColW) + 2;
-            let right = left + dayColW - 4;
-            let ew = right - left;
-            let eh = bot - top;
-            
-            doc.setFillColor(ev.color);
-            doc.roundedRect(left, top, ew, eh, 3, 3, "F");
-            
+            let left = rPage.left + timeColW + (colIdx * dayColW) + 2; let right = left + dayColW - 4;
+            let ew = right - left; let eh = bot - top;
+            doc.setFillColor(ev.color); doc.roundedRect(left, top, ew, eh, 3, 3, "F");
             if (eh > 18) {
-                doc.setFont("helvetica", "bold");
-                doc.setFontSize(9);
-                doc.setTextColor(255, 255, 255);
-                
+                doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(255, 255, 255);
                 let titleStr = ev.title.length > 20 ? ev.title.substring(0, 17) + "..." : ev.title;
                 doc.text(titleStr, left + 4, top + 10, { maxWidth: ew - 8 });
-                
-                doc.setFont("helvetica", "normal");
-                doc.text(`${minToTimeStr(ev.startMin)} - ${minToTimeStr(ev.startMin+ev.duration)}`, left + 4, top + 20);
+                doc.setFont("helvetica", "normal"); doc.text(`${minToTimeStr(ev.startMin)} - ${minToTimeStr(ev.startMin+ev.duration)}`, left + 4, top + 20);
             }
         }
     });
 
     let pdfName = "Schedule.pdf";
-    if (visiblePeopleIndices.length === 1) {
-        let shortName = people[visiblePeopleIndices[0]] || currentUser || "Calendar";
+    let wkDate = new Date(viewStart); wkDate.setHours(0,0,0,0);
+    let weekNo = Math.ceil((((wkDate - new Date(wkDate.getFullYear(), 0, 1)) / 86400000) + new Date(wkDate.getFullYear(), 0, 1).getDay() + 1) / 7);
+    let datePrefix = `${wkDate.getFullYear()}${String(wkDate.getMonth()+1).padStart(2,'0')}${String(wkDate.getDate()).padStart(2,'0')}_WK${weekNo}`;
+
+    if (activeVisiblePeople.length === 1) {
+        let shortName = people[activeVisiblePeople[0]] || currentUser || "Calendar";
         let contactMatch = contacts.find(c => c.username === shortName);
         let finalName = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : shortName;
-        pdfName = finalName.replace(/[^a-z0-9]/gi, '_') + "_Schedule.pdf";
+        pdfName = `${datePrefix}_${finalName.replace(/[^a-z0-9]/gi, '_')}.pdf`;
     } else if (currentUser) {
-        pdfName = currentUser.replace(/[^a-z0-9]/gi, '_') + "_Schedule.pdf";
-    }
+        pdfName = `${datePrefix}_${currentUser.replace(/[^a-z0-9]/gi, '_')}.pdf`;
+    } else { pdfName = `${datePrefix}_Schedule.pdf`; }
     doc.save(pdfName);
 });
 
 document.getElementById('btnExport')?.addEventListener('click', () => {
-    let content = "========================================\r\n           UPCOMING SCHEDULE            \r\n========================================\r\n\r\n";
+    let activeVisiblePeople = getEffectiveVisiblePeople();
     let displayEvents = typeof unrollEvents === 'function' ? unrollEvents() : events;
-    let sorted = displayEvents.filter(e => e.date >= formatDate(new Date())).sort((a,b) => a.date.localeCompare(b.date) || a.startMin - b.startMin);
-    
-    sorted.forEach(e => {
-        let p = people[e.personIdx] || "";
-        content += `${e.title}\r\n${e.date}       ${minToTimeStr(e.startMin)} - ${minToTimeStr(e.startMin+e.duration)}       ${p}\r\n----------------------------------------\r\n`;
-    });
-    
+    let content = "";
+    let fileName = "";
+
+    if (viewMode === 8) {
+        let viewStart = new Date(currentDate); 
+        viewStart.setDate(viewStart.getDate() - viewStart.getDay());
+        
+        let pad = (str, len) => (str.length > len ? str.substring(0, len) : str.padEnd(len, ' '));
+        
+        content = "====================================================================================================================================\r\n";
+        content += "WORKER       | HRS  | SUN            | MON            | TUE            | WED            | THU            | FRI            | SAT            \r\n";
+        content += "====================================================================================================================================\r\n";
+        
+        let gRestStr = document.getElementById('globalSchedRest')?.value;
+        let gRestMins = (gRestStr && gRestStr.toLowerCase() !== 'clear') ? parseFloat(gRestStr) * 60 : 0;
+        if (isNaN(gRestMins)) gRestMins = 0;
+
+        activeVisiblePeople.forEach(pIdx => {
+            let shortName = people[pIdx] || `Person ${pIdx + 1}`;
+            let contactMatch = contacts.find(c => c.username === shortName);
+            let pName = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : shortName;
+            
+            let uRestMins = gRestMins;
+            if (schedUserData[pIdx] && schedUserData[pIdx].r && schedUserData[pIdx].r.toLowerCase() !== 'clear') uRestMins = parseFloat(schedUserData[pIdx].r) * 60;
+            
+            let totalPaidMins = 0;
+            let dailyData = [];
+            
+            for (let i = 0; i < 7; i++) {
+                let d = new Date(viewStart); d.setDate(d.getDate() + i);
+                let dayEvs = displayEvents.filter(e => e.date === formatDate(d) && e.personIdx === pIdx);
+                let dailyWorkMins = 0;
+                dayEvs.forEach(e => { if (!/\bOFF\b/.test((e.title || "").toUpperCase())) dailyWorkMins += e.duration; });
+                if (dailyWorkMins > uRestMins) totalPaidMins += (dailyWorkMins - uRestMins);
+                else totalPaidMins += dailyWorkMins;
+                
+                dayEvs.sort((a,b) => a.startMin - b.startMin);
+                let evStrs = dayEvs.map(e => {
+                    if (/\bOFF\b/.test((e.title||"").toUpperCase())) return e.title;
+                    return `${minToTimeStr(e.startMin)}-${minToTimeStr(e.startMin+e.duration)}`;
+                });
+                dailyData.push(evStrs.join(', ') || "");
+            }
+            
+            let hrsStr = (totalPaidMins / 60).toFixed(1) + "h";
+            content += `${pad(pName, 12)} | ${pad(hrsStr, 4)} | ${pad(dailyData[0], 14)} | ${pad(dailyData[1], 14)} | ${pad(dailyData[2], 14)} | ${pad(dailyData[3], 14)} | ${pad(dailyData[4], 14)} | ${pad(dailyData[5], 14)} | ${pad(dailyData[6], 14)}\r\n`;
+        });
+        
+        content += "====================================================================================================================================\r\n";
+        
+        let wkDate = new Date(viewStart); wkDate.setHours(0,0,0,0);
+        let weekNo = Math.ceil((((wkDate - new Date(wkDate.getFullYear(), 0, 1)) / 86400000) + new Date(wkDate.getFullYear(), 0, 1).getDay() + 1) / 7);
+        fileName = `${wkDate.getFullYear()}${String(wkDate.getMonth()+1).padStart(2,'0')}${String(wkDate.getDate()).padStart(2,'0')}_WK${weekNo}_Schedule.txt`;
+
+    } else {
+        content = "========================================\r\n           EVENTS SCHEDULE            \r\n========================================\r\n\r\n";
+        let validEvents = displayEvents.filter(e => {
+            if (e.date < formatDate(new Date())) return false;
+            if (activeVisiblePeople.length > 0 && !activeVisiblePeople.includes(e.personIdx)) return false;
+            return true;
+        });
+
+        let sorted = validEvents.sort((a,b) => a.date.localeCompare(b.date) || a.startMin - b.startMin);
+        sorted.forEach(e => {
+            let p = people[e.personIdx] || "";
+            content += `${e.title}\r\n${e.date}       ${minToTimeStr(e.startMin)} - ${minToTimeStr(e.startMin+e.duration)}       ${p}\r\n----------------------------------------\r\n`;
+        });
+        
+        let viewStart = new Date(currentDate); 
+        if (viewMode === 3) viewStart.setDate(viewStart.getDate() - viewStart.getDay());
+        let wkDate = new Date(viewStart); wkDate.setHours(0,0,0,0);
+        let weekNo = Math.ceil((((wkDate - new Date(wkDate.getFullYear(), 0, 1)) / 86400000) + new Date(wkDate.getFullYear(), 0, 1).getDay() + 1) / 7);
+        let datePrefix = `${wkDate.getFullYear()}${String(wkDate.getMonth()+1).padStart(2,'0')}${String(wkDate.getDate()).padStart(2,'0')}_WK${weekNo}`;
+        
+        fileName = `${datePrefix}.txt`;
+        if (activeVisiblePeople.length === 1) {
+            let shortName = people[activeVisiblePeople[0]] || currentUser || "Calendar";
+            let contactMatch = contacts.find(c => c.username === shortName);
+            let finalName = (contactMatch && (contactMatch.fn || contactMatch.fullname)) ? (contactMatch.fn || contactMatch.fullname) : shortName;
+            fileName = `${datePrefix}_${finalName.replace(/[^a-z0-9]/gi, '_').toUpperCase()}.txt`;
+        }
+    }
+
     let blob = new Blob([content], {type: "text/plain"});
-    let url = URL.createObjectURL(blob);
-    let a = document.createElement('a');
-    a.href = url;
-    a.download = "Upcoming_Schedule.txt";
-    a.click();
-    URL.revokeObjectURL(url);
+    let url = URL.createObjectURL(blob); let a = document.createElement('a'); a.href = url; a.download = fileName;
+    a.click(); URL.revokeObjectURL(url);
 });
 
-updateLayout();
-downloadUpdates();
+updateLayout(); downloadUpdates();
+
+async function loadSetting(key, defaultVal) {
+    try {
+        let res = await fetch(`${window.location.origin}/api/setting?key=${key}`, { headers: { 'Authorization': getAuthHeader() } });
+        if (res.ok) { let text = await res.text(); return text.trim() !== "" ? text.trim() : defaultVal; }
+    } catch(e) {}
+    return defaultVal;
+}
+
+async function saveSetting(key, val) {
+    try { await fetch(`${window.location.origin}/api/setting`, { method: 'PUT', headers: { 'Authorization': getAuthHeader() }, body: `${key}=${val}` }); } catch(e) {}
+}
+
+window.addEventListener('DOMContentLoaded', async () => {
+    let schedHeader = document.getElementById('schedHeaderRow');
+    if (schedHeader) {
+        schedHeader.innerHTML = `
+            <div style="width:15px;"></div>
+            <div style="width:120px; cursor:pointer;" onclick="sortSchedList('user')">User</div>
+            <div style="width:120px; cursor:pointer;" onclick="sortSchedList('coverage')">Coverage Hours</div>
+            <div style="width:120px; cursor:pointer;" onclick="sortSchedList('pref')">Preferred</div>
+            <div style="width:85px; cursor:pointer;" onclick="sortSchedList('days')">Days</div>
+            <div style="width:75px; cursor:pointer;" onclick="sortSchedList('rest')">Rest(h)</div>
+            <div style="width:75px; cursor:pointer;" onclick="sortSchedList('daily')">Daily</div>
+            <div style="width:75px; cursor:pointer;" onclick="sortSchedList('weekly')">Weekly</div>
+        `;
+    }
+    
+    let btnContainer = document.getElementById('btnMakeSchedule')?.parentElement;
+    if (btnContainer && !document.getElementById('btnSchedClearWeek')) {
+        btnContainer.insertAdjacentHTML('afterbegin', `<button id="btnSchedClearWeek" style="background:#E53935; color:#fff; border:none; padding:8px 16px; border-radius:3px; cursor:pointer;">Clear</button>`);
+        
+        document.getElementById('btnSchedClearWeek').addEventListener('click', async () => {
+            let activeMode = document.getElementById('comboDefaultEvent')?.value || "WORKING";
+            if (!confirm(`Are you sure you want to clear all ${activeMode} events for this week?`)) return;
+            window.isScheduling = true;
+            try {
+                let weekStartStr = document.getElementById('schedWeekSelect').value;
+                let startDate = new Date(weekStartStr.replace(/\//g, '-') + 'T12:00:00');
+                
+                let qToUpdate = new Set();
+                let eventsToKeep = [];
+                let eventsDeleted = 0;
+                
+                events.forEach(e => {
+                    let evDate = new Date(e.date.replace(/\//g, '-') + 'T12:00:00');
+                    let diffDays = Math.round((evDate.getTime() - startDate.getTime()) / 86400000);
+                    
+                    if (diffDays >= 0 && diffDays < 7) {
+                        let eTitle = (e.title || "").toUpperCase();
+                        if (eTitle.includes(activeMode.toUpperCase())) {
+                            qToUpdate.add(getStorageKey(e.date));
+                            eventsDeleted++;
+                        } else eventsToKeep.push(e);
+                    } else eventsToKeep.push(e);
+                });
+                
+                if (eventsDeleted > 0) {
+                    events = eventsToKeep;
+                    for (let q of qToUpdate) {
+                        let dayEvents = events.filter(e => getStorageKey(e.date) === q);
+                        try {
+                            if (dayEvents.length === 0) await fetch(`${CALDAV_URL}${q}.json`, { method: 'DELETE', headers: { 'Authorization': getAuthHeader() } });
+                            else await fetch(`${CALDAV_URL}${q}.json`, { method: 'PUT', headers: { 'Content-Type': 'application/json', 'Authorization': getAuthHeader() }, body: JSON.stringify(dayEvents) });
+                        } catch(err) {}
+                    }
+                    render();
+                }
+            } finally { window.isScheduling = false; }
+        });
+    }
+
+    let defText = await loadSetting('default_event', 'WORKING');
+    let cbo = document.getElementById('comboDefaultEvent'); if (cbo) cbo.value = defText;
+
+    let gw = await loadSetting('global_weekly', '40'); let gda = await loadSetting('global_daily', '8');
+    let gr = await loadSetting('global_rest', '0.5'); let gc = await loadSetting('global_coverage', '9-5');
+    let gp = await loadSetting('global_pref', 'Default'); let gd = await loadSetting('global_days', '2,3,4,5,6');
+    
+    if (document.getElementById('globalSchedWeekly')) document.getElementById('globalSchedWeekly').value = gw;
+    if (document.getElementById('globalSchedDaily')) document.getElementById('globalSchedDaily').value = gda;
+    if (document.getElementById('globalSchedRest')) document.getElementById('globalSchedRest').value = gr;
+    if (document.getElementById('globalSchedCoverage')) document.getElementById('globalSchedCoverage').value = gc;
+    if (document.getElementById('globalSchedPref')) document.getElementById('globalSchedPref').value = gp;
+    if (document.getElementById('globalSchedDays')) document.getElementById('globalSchedDays').value = gd;
+    
+    ['globalSchedWeekly', 'globalSchedDaily', 'globalSchedRest', 'globalSchedCoverage', 'globalSchedPref', 'globalSchedDays'].forEach(id => {
+        document.getElementById(id)?.addEventListener('change', (e) => {
+            let type = e.target.dataset.type;
+            if (!validateSchedInput(type, e.target.value)) {
+                alert(`Invalid input format for ${type}.`);
+                e.target.value = '';
+                return;
+            }
+            
+            let key = id === 'globalSchedWeekly' ? 'global_weekly' : id === 'globalSchedDaily' ? 'global_daily' : id === 'globalSchedRest' ? 'global_rest' :
+                      id === 'globalSchedDays' ? 'global_days' : id === 'globalSchedCoverage' ? 'global_coverage' : 'global_pref';
+            
+            if (e.target.value.toLowerCase() === 'clear') {
+                let cls = id === 'globalSchedWeekly' ? '.sched-weekly' : id === 'globalSchedDaily' ? '.sched-daily' : id === 'globalSchedRest' ? '.sched-rest' :
+                          id === 'globalSchedDays' ? '.sched-days' : id === 'globalSchedCoverage' ? '.sched-coverage' : '.sched-pref';
+                document.querySelectorAll(cls).forEach(el => { el.value = ''; el.dispatchEvent(new Event('change', { bubbles: true })); });
+                e.target.value = ''; saveSetting(key, "");
+            } else {
+                saveSetting(key, e.target.value);
+            }
+        });
+    });
+});
+
+document.getElementById('comboDefaultEvent')?.addEventListener('change', (e) => { saveSetting('default_event', e.target.value); });
+
+
+// --- AUTOMATED SCHEDULING SYSTEM ---
+let currentSchedYear = new Date().getFullYear();
+let unselectedSchedUsers = new Set();
+let schedUserData = {}; 
+let hasLoadedSchedUsers = false;
+
+document.getElementById('btnScheduling')?.addEventListener('click', async () => {
+    populateWeeks();
+    let defFilter = await loadSetting('sched_filter', '');
+    document.getElementById('schedUserFilter').value = defFilter;
+    
+    let savedUserData = await loadSetting('sched_user_data', '{}');
+    try {
+        schedUserData = JSON.parse(savedUserData);
+    } catch(e) {
+        schedUserData = {};
+    }
+
+    if (!hasLoadedSchedUsers) {
+        let savedChecked = await loadSetting('sched_checked', 'NONE');
+        unselectedSchedUsers.clear();
+        if (savedChecked === 'NONE') {
+            people.forEach((_, idx) => unselectedSchedUsers.add(idx));
+        } else {
+            let checkedArr = savedChecked.split(',').map(Number).filter(n => !isNaN(n));
+            people.forEach((_, idx) => {
+                if (!checkedArr.includes(idx)) unselectedSchedUsers.add(idx);
+            });
+        }
+        hasLoadedSchedUsers = true;
+    }
+
+    renderSchedUsers();
+    document.getElementById('schedulingModal').style.display = 'flex';
+});
+
+function saveSchedChecked() {
+    let checked = people.map((_, i) => i).filter(i => !unselectedSchedUsers.has(i));
+    saveSetting('sched_checked', checked.join(','));
+}
+
+function populateWeeks() {
+    let sel = document.getElementById('schedWeekSelect'); sel.innerHTML = '';
+    let d = new Date(currentSchedYear, 0, 1); d.setDate(d.getDate() - d.getDay()); 
+    let w = 1, selIdx = 0;
+    let disp = new Date(currentDate); disp.setDate(disp.getDate() - disp.getDay());
+    let dispWeekStr = formatDate(disp);
+    
+    while (d.getFullYear() <= currentSchedYear) {
+        if (d.getFullYear() === currentSchedYear || w === 1) {
+            let opt = document.createElement('option');
+            let dtStr = formatDate(d); opt.value = dtStr; opt.innerText = `${dtStr} W${String(w).padStart(2, '0')}`;
+            sel.appendChild(opt); if (dtStr === dispWeekStr) selIdx = sel.options.length - 1; w++;
+        }
+        d.setDate(d.getDate() + 7);
+    }
+    if (sel.options.length > selIdx) sel.selectedIndex = selIdx;
+}
+
+document.getElementById('btnPrevWeek')?.addEventListener('click', () => {
+    let sel = document.getElementById('schedWeekSelect');
+    if (sel.selectedIndex > 0) sel.selectedIndex--;
+    else { currentSchedYear--; populateWeeks(); document.getElementById('schedWeekSelect').selectedIndex = document.getElementById('schedWeekSelect').options.length - 1; }
+});
+
+document.getElementById('btnNextWeek')?.addEventListener('click', () => {
+    let sel = document.getElementById('schedWeekSelect');
+    if (sel.selectedIndex < sel.options.length - 1) sel.selectedIndex++;
+    else { currentSchedYear++; populateWeeks(); document.getElementById('schedWeekSelect').selectedIndex = 0; }
+});
+
+document.getElementById('schedWeekSelect')?.addEventListener('change', () => {
+    let yr = parseInt(document.getElementById('schedWeekSelect').value.substring(0,4));
+    if (yr !== currentSchedYear) { currentSchedYear = yr; populateWeeks(); }
+});
+
+document.getElementById('schedUserFilter')?.addEventListener('input', (e) => {
+    saveSetting('sched_filter', e.target.value); renderSchedUsers();
+});
+
+let currentSortCol = 'user';
+let currentSortDir = 1;
+
+window.sortSchedList = function(col) {
+    if (currentSortCol === col) currentSortDir *= -1;
+    else { currentSortCol = col; currentSortDir = 1; }
+    renderSchedUsers();
+};
+
+function renderSchedUsers() {
+    let filter = document.getElementById('schedUserFilter').value.toLowerCase();
+    let list = document.getElementById('schedUserList'); list.innerHTML = '';
+    
+    let usersArr = people.map((p, i) => ({
+        pIdx: i, name: p,
+        w: schedUserData[i]?.w || '', da: schedUserData[i]?.da || '', r: schedUserData[i]?.r || '',
+        c: schedUserData[i]?.c || '', p_val: schedUserData[i]?.p || '', d: schedUserData[i]?.d || ''
+    })).filter(u => u.name && u.name.toLowerCase().includes(filter));
+
+    usersArr.sort((a, b) => {
+        let isPersonA = a.name.startsWith("Person "); let isPersonB = b.name.startsWith("Person ");
+        if (isPersonA && !isPersonB) return 1; if (!isPersonA && isPersonB) return -1;
+
+        let valA = a.name.toLowerCase(), valB = b.name.toLowerCase();
+        if (currentSortCol === 'weekly') { valA = parseFloat(a.w) || 0; valB = parseFloat(b.w) || 0; }
+        else if (currentSortCol === 'daily') { valA = parseFloat(a.da) || 0; valB = parseFloat(b.da) || 0; }
+        else if (currentSortCol === 'rest') { valA = parseFloat(a.r) || 0; valB = parseFloat(b.r) || 0; }
+        else if (currentSortCol === 'coverage') { valA = a.c; valB = b.c; }
+        else if (currentSortCol === 'pref') { valA = a.p_val; valB = b.p_val; }
+        else if (currentSortCol === 'days') { valA = a.d; valB = b.d; }
+        
+        if (valA < valB) return -1 * currentSortDir; if (valA > valB) return 1 * currentSortDir; return 0;
+    });
+
+    usersArr.forEach(u => {
+        let div = document.createElement('div');
+        div.style.display = 'flex'; div.style.gap = '10px'; div.style.marginBottom = '6px'; div.style.alignItems = 'center'; div.style.padding = '0 10px';
+        div.dataset.pidx = u.pIdx; let isChecked = !unselectedSchedUsers.has(u.pIdx);
+        
+        div.innerHTML = `
+            <input type="checkbox" class="sched-chk" value="${u.pIdx}" style="width:15px; margin:0;" ${isChecked ? 'checked' : ''}>
+            <label style="width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${u.name}">${u.name}</label>
+            <input type="text" class="sched-coverage" data-type="coverage" list="dl-coverage" style="width:120px; padding:2px;">
+            <input type="text" class="sched-pref" data-type="pref" list="dl-pref" style="width:120px; padding:2px;">
+            <input type="text" class="sched-days" data-type="days" list="dl-days" style="width:85px; padding:2px;">
+            <input type="text" class="sched-rest" data-type="rest" list="dl-rest" style="width:75px; padding:2px;">
+            <input type="text" class="sched-daily" data-type="daily" list="dl-daily" style="width:75px; padding:2px;">
+            <input type="text" class="sched-weekly" data-type="weekly" list="dl-weekly" style="width:75px; padding:2px;">
+        `;
+        list.appendChild(div);
+        
+        div.querySelector('.sched-coverage').value = u.c;
+        div.querySelector('.sched-pref').value = u.p_val;
+        div.querySelector('.sched-days').value = u.d;
+        div.querySelector('.sched-rest').value = u.r;
+        div.querySelector('.sched-daily').value = u.da;
+        div.querySelector('.sched-weekly').value = u.w;
+    });
+}
+
+document.getElementById('btnSchedSelectAll')?.addEventListener('click', () => {
+    unselectedSchedUsers.clear(); document.querySelectorAll('.sched-chk').forEach(c => c.checked = true);
+    saveSchedChecked();
+});
+
+document.getElementById('btnSchedSelectNone')?.addEventListener('click', () => {
+    document.querySelectorAll('.sched-chk').forEach(c => { c.checked = false; unselectedSchedUsers.add(parseInt(c.value)); });
+    saveSchedChecked();
+});
+
+let saveUserDataTimeout = null;
+function deferredSaveUserData() {
+    if (saveUserDataTimeout) clearTimeout(saveUserDataTimeout);
+    saveUserDataTimeout = setTimeout(() => {
+        saveSetting('sched_user_data', JSON.stringify(schedUserData));
+    }, 300);
+}
+
+document.getElementById('schedUserList')?.addEventListener('change', (e) => {
+    let row = e.target.closest('div[data-pidx]');
+    if (row && e.target.tagName === 'INPUT' && e.target.dataset.type) {
+        let type = e.target.dataset.type;
+        if (!validateSchedInput(type, e.target.value)) {
+            alert(`Invalid input format for ${type}.`);
+            e.target.value = '';
+            return;
+        }
+        
+        let pIdx = parseInt(row.dataset.pidx);
+        if (!schedUserData[pIdx]) schedUserData[pIdx] = {};
+        if (e.target.classList.contains('sched-weekly')) schedUserData[pIdx].w = e.target.value;
+        if (e.target.classList.contains('sched-daily')) schedUserData[pIdx].da = e.target.value;
+        if (e.target.classList.contains('sched-rest')) schedUserData[pIdx].r = e.target.value;
+        if (e.target.classList.contains('sched-coverage')) schedUserData[pIdx].c = e.target.value;
+        if (e.target.classList.contains('sched-pref')) schedUserData[pIdx].p = e.target.value;
+        if (e.target.classList.contains('sched-days')) schedUserData[pIdx].d = e.target.value;
+        
+        deferredSaveUserData();
+    }
+    if (e.target.classList.contains('sched-chk')) {
+        let idx = parseInt(e.target.value);
+        if (e.target.checked) unselectedSchedUsers.delete(idx); else unselectedSchedUsers.add(idx);
+        saveSchedChecked();
+    }
+});
+
+function parseTimeStr(t) {
+    if (!t) return NaN;
+    let p = t.split(':');
+    let h = parseInt(p[0]); let m = p.length > 1 ? parseInt(p[1]) : 0;
+    if (isNaN(m)) m = 0;
+    if (h >= 1 && h <= 7) h += 12;
+    return h * 60 + m;
+}
+
+function parseShiftList(str) {
+    if (!str || str.toLowerCase() === 'default' || str.toLowerCase() === 'clear') return [];
+    let shifts = [];
+    str.split(',').forEach(p => {
+        let pTrim = p.trim(); if (!pTrim) return;
+        let bounds = pTrim.split('-');
+        if (bounds.length === 2) {
+            let s = parseTimeStr(bounds[0]); let e = parseTimeStr(bounds[1]);
+            if (e < s) e += 24*60; 
+            shifts.push({ start: s, span: e - s });
+        }
+    });
+    return shifts;
+}
+
+document.getElementById('btnMakeSchedule')?.addEventListener('click', async () => {
+    let activeMode = document.getElementById('comboDefaultEvent')?.value || "WORKING";
+    if (!confirm(`Are you sure you want to Create a Schedule using ${activeMode}?`)) return;
+
+    window.isScheduling = true;
+    try {
+        let weekSelectEl = document.getElementById('schedWeekSelect');
+        if (!weekSelectEl) throw new Error("schedWeekSelect not found.");
+        let weekStartStr = weekSelectEl.value || "";
+        
+        let [y, m, d] = weekStartStr.split(/[-/]/);
+        if (y && y.length !== 4) { 
+            let temp = y; y = d; d = temp; 
+        }
+        let startDate = new Date(y, (parseInt(m) - 1).toString(), d, 12, 0, 0);
+
+        const isOffEvent = (e) => /\bOFF\b/i.test(e.title || "") || (e.title || "").toUpperCase().includes("OFF");
+
+        const findAvailableSlots = (rangeStartMin, rangeEndMin, offEvents) => {
+            let sortedOffs = [...offEvents]
+                .map(e => ({ startMin: Number(e.startMin), duration: Number(e.duration) }))
+                .sort((a, b) => a.startMin - b.startMin);
+            let currentTime = Number(rangeStartMin);
+            let endMin = Number(rangeEndMin);
+            let availableChunks = [];
+            
+            for (let event of sortedOffs) {
+                let evEndMin = event.startMin + event.duration;
+                if (evEndMin <= currentTime || event.startMin >= endMin) continue;
+                
+                if (event.startMin > currentTime) {
+                    availableChunks.push({ start: currentTime, end: Math.min(event.startMin, endMin) });
+                }
+                
+                if (evEndMin > currentTime) {
+                    currentTime = evEndMin;
+                }
+            }
+            
+            if (currentTime < endMin) {
+                availableChunks.push({ start: currentTime, end: endMin });
+            }
+            return availableChunks;
+        };
+
+        // Build the set of 7 date strings for the selected week
+        let weekDates = [];
+        for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
+            let curDate = new Date(startDate);
+            curDate.setDate(curDate.getDate() + dayOffset);
+            weekDates.push(formatDate(curDate));
+        }
+
+        let qToUpdate = new Set();
+
+        // If an unscheduled manager (e.g. admin) created OFF events while filtering a specific person in Week View,
+        // reassign those OFF events to the filtered person so they properly trim that person's shifts.
+        let myIdx = people.indexOf(currentUser);
+        let tempFilterVal = document.getElementById('comboTempPersonFilter')?.value;
+        if (myIdx !== -1 && unselectedSchedUsers.has(myIdx) && tempFilterVal !== "" && tempFilterVal !== undefined) {
+            let targetIdx = parseInt(tempFilterVal, 10);
+            if (!isNaN(targetIdx)) {
+                events.forEach(e => {
+                    if (weekDates.includes(e.date) && Number(e.personIdx) === myIdx && isOffEvent(e)) {
+                        e.personIdx = targetIdx;
+                        e.color = colors[targetIdx % colors.length];
+                        qToUpdate.add(getStorageKey(e.date));
+                    }
+                });
+            }
+        }
+
+        // Pre-pass: Trim any ALREADY EXISTING working events in this week that overlap with OFF events
+        let allEvsInitial = typeof unrollEvents === 'function' ? unrollEvents() : events;
+        let preTrimmedEvents = [];
+        for (let ev of events) {
+            if (weekDates.includes(ev.date) && !isOffEvent(ev)) {
+                let dailyOffs = allEvsInitial.filter(e => 
+                    getStorageKey(e.date) === getStorageKey(ev.date) && 
+                    Number(e.personIdx) === Number(ev.personIdx) && 
+                    isOffEvent(e)
+                );
+                if (dailyOffs.length > 0) {
+                    qToUpdate.add(getStorageKey(ev.date));
+                    let validChunks = findAvailableSlots(ev.startMin, Number(ev.startMin) + Number(ev.duration), dailyOffs);
+                    validChunks.forEach(chunk => {
+                        if (chunk.end - chunk.start > 0) {
+                            preTrimmedEvents.push({
+                                ...ev,
+                                id: crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString() + Math.random()),
+                                startMin: chunk.start,
+                                duration: chunk.end - chunk.start
+                            });
+                        }
+                    });
+                } else {
+                    preTrimmedEvents.push(ev);
+                }
+            } else {
+                preTrimmedEvents.push(ev);
+            }
+        }
+        events = preTrimmedEvents;
+
+        let allEvs = typeof unrollEvents === 'function' ? unrollEvents() : events;
+        
+        let gWeekly = document.getElementById('globalSchedWeekly')?.value || "40";
+        let gDaily = document.getElementById('globalSchedDaily')?.value || "8";
+        let gRest = document.getElementById('globalSchedRest')?.value || "0.5";
+        let gCoverage = document.getElementById('globalSchedCoverage')?.value || "9-5";
+        let gPref = document.getElementById('globalSchedPref')?.value || "Default";
+        let gDays = document.getElementById('globalSchedDays')?.value || "2,3,4,5,6";
+
+        let users = [];
+
+        for (let pIdx = 0; pIdx < people.length; pIdx++) {
+            if (!people[pIdx]) continue;
+            if (unselectedSchedUsers.has(pIdx)) continue;
+            
+            let data = schedUserData[pIdx] || {};
+            let pW = data.w; let pDa = data.da;
+            let pR = data.r; let pC_val = data.c;
+            let pP_val = data.p; let pD = data.d;
+            
+            let hasCustomPref = (pP_val && pP_val.toLowerCase() !== 'clear' && pP_val.toLowerCase() !== 'default');
+            
+            if (!pW || pW.toLowerCase() === 'clear') pW = gWeekly; 
+            if (!pDa || pDa.toLowerCase() === 'clear') pDa = gDaily;
+            if (!pR || pR.toLowerCase() === 'clear') pR = gRest; 
+            if (!pC_val || pC_val.toLowerCase() === 'clear') pC_val = gCoverage;
+            if (!pP_val || pP_val.toLowerCase() === 'clear') pP_val = gPref; 
+            if (!pD || pD.toLowerCase() === 'clear') pD = gDays;
+            
+            if (!pW || !pC_val || !pP_val) continue;
+
+            let weeklyMins = parseFloat(pW) * 60; if (isNaN(weeklyMins) || weeklyMins <= 0) continue;
+            let dailyMaxMins = parseFloat(pDa) * 60; if (isNaN(dailyMaxMins) || dailyMaxMins <= 0) dailyMaxMins = 480;
+            let restMins = parseFloat(pR) * 60; if (isNaN(restMins)) restMins = 0;
+            
+            let allowedDays = [];
+            if (pD && pD.toLowerCase() !== 'clear') allowedDays = pD.split(',').map(n => parseInt(n) - 1).filter(n => !isNaN(n));
+            if (allowedDays.length === 0) allowedDays = [1, 2, 3, 4, 5];
+
+            let shiftTemplates = [
+                ...parseShiftList(pP_val).map(s => ({ start: s.start, span: s.span, isPref: hasCustomPref })),
+                ...parseShiftList(pC_val).map(s => ({ start: s.start, span: s.span, isPref: false }))
+            ];
+            if (shiftTemplates.length === 0) continue;
+
+            let dailyMinsArray = Array(7).fill(0);
+            let preScheduledMinsTotal = 0;
+            
+            for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
+                let dStr = weekDates[dayOffset];
+                let existingEvs = allEvs.filter(e => getStorageKey(e.date) === getStorageKey(dStr) && Number(e.personIdx) === pIdx && !isOffEvent(e));
+                let dTotal = existingEvs.reduce((sum, e) => sum + Number(e.duration), 0);
+                dailyMinsArray[dayOffset] += dTotal;
+                preScheduledMinsTotal += dTotal;
+            }
+
+            let weeklyMinsAdj = Math.max(0, weeklyMins - preScheduledMinsTotal);
+            if (weeklyMinsAdj <= 0) continue; 
+
+            users.push({ pIdx: pIdx, weeklyMins: weeklyMinsAdj, restMins: restMins, dailyMaxMins: dailyMaxMins, templates: shiftTemplates, allowedDays: allowedDays, dailyMins: dailyMinsArray });
+        }
+
+        let intervalCoverage = Array(7).fill(0).map(() => Array(48).fill(0));
+        let newEvents = [];
+        
+        for (let phase = 1; phase <= 2; phase++) {
+            let madeAssignment = true;
+
+            while (madeAssignment) {
+                await new Promise(resolve => setTimeout(resolve, 0));
+
+                madeAssignment = false;
+                let bestGlobalScore = Infinity;
+                let bestGlobalUser = null;
+                let bestGlobalDay = -1;
+                let bestGlobalShift = null;
+
+                for (let u of users) {
+                    if (u.weeklyMins <= 0) continue;
+                    
+                    for (let d = 0; d < 7; d++) {
+                        if (u.dailyMins[d] > 0) continue; 
+                        
+                        let curDate = new Date(startDate); curDate.setDate(curDate.getDate() + d);
+                        let dStr = weekDates[d];
+
+                        let remDaily = u.dailyMaxMins - u.dailyMins[d];
+                        if (remDaily <= 0) continue; 
+                        
+                        if (!u.allowedDays.includes(curDate.getDay())) continue;
+                        
+                        let dayEvs = allEvs.filter(e => getStorageKey(e.date) === getStorageKey(dStr) && Number(e.personIdx) === u.pIdx && !isOffEvent(e));
+                        let busy = dayEvs.map(e => ({ s: Number(e.startMin), e: Number(e.startMin) + Number(e.duration) }));
+                        for (let ne of newEvents) {
+                            if (getStorageKey(ne.date) === getStorageKey(dStr) && Number(ne.personIdx) === u.pIdx) {
+                                busy.push({ s: Number(ne.startMin), e: Number(ne.startMin) + Number(ne.duration) });
+                            }
+                        }
+                        busy.sort((a,b) => a.s - b.s);
+
+                        let dayOffs = allEvs.filter(e => getStorageKey(e.date) === getStorageKey(dStr) && Number(e.personIdx) === u.pIdx && isOffEvent(e));
+
+                        for (let t of u.templates) {
+                            if (phase === 1 && !t.isPref) continue;
+
+                            let tStart = t.start;
+                            let tEnd = t.start + t.span;
+                            
+                            let freeGaps = [];
+                            let curr = tStart;
+                            for (let b of busy) {
+                                if (b.s > curr && b.s < tEnd) freeGaps.push({ s: curr, e: Math.min(b.s, tEnd) });
+                                if (b.e > curr) curr = b.e;
+                            }
+                            if (curr < tEnd) freeGaps.push({ s: curr, e: tEnd });
+
+                            for (let gap of freeGaps) {
+                                let gapSpan = gap.e - gap.s;
+                                if (gapSpan < 60) continue; 
+                                
+                                let targetPaid = Math.min(u.weeklyMins, remDaily, t.span);
+                                let targetSpan = targetPaid + u.restMins;
+                                
+                                let actualSpan = Math.min(gapSpan, targetSpan);
+                                if (actualSpan < 60) continue;
+
+                                let actualPaid = actualSpan > u.restMins ? actualSpan - u.restMins : actualSpan;
+                                
+                                let maxSlide = gap.e - gap.s - actualSpan;
+                                for (let slide = 0; slide <= maxSlide; slide += 30) {
+                                    let sStart = gap.s + slide;
+                                    
+                                    let offOverlap = 0;
+                                    for (let off of dayOffs) {
+                                        let overlapS = Math.max(sStart, Number(off.startMin));
+                                        let overlapE = Math.min(sStart + actualSpan, Number(off.startMin) + Number(off.duration));
+                                        if (overlapS < overlapE) {
+                                            offOverlap += (overlapE - overlapS);
+                                        }
+                                    }
+                                    
+                                    let expectedYield = actualPaid - offOverlap;
+                                    if (expectedYield <= 0) continue;
+
+                                    let penalty = 0;
+                                    let sIdx = Math.floor(sStart / 30);
+                                    let eIdx = Math.floor((sStart + actualSpan) / 30);
+                                    
+                                    for (let idx = sIdx; idx < eIdx && idx < 48; idx++) {
+                                        let c = intervalCoverage[d][idx];
+                                        if (c === 0) penalty -= 10000;
+                                        else if (c === 1) penalty -= 1000;
+                                        else if (c === 2) penalty -= 100;
+                                        else penalty -= 10; 
+                                    }
+                                    
+                                    if (t.isPref) penalty -= 500; 
+                                    penalty -= (expectedYield * 1000); 
+                                    
+                                    let score = penalty - (u.weeklyMins * 100);
+
+                                    if (score < bestGlobalScore) {
+                                        bestGlobalScore = score; bestGlobalUser = u; bestGlobalDay = d;
+                                        bestGlobalShift = { start: sStart, span: actualSpan, paid: expectedYield };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } 
+
+                if (bestGlobalUser && bestGlobalShift) {
+                    let dStr = weekDates[bestGlobalDay];
+                    
+                    let newEv = {
+                        id: crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString() + Math.random()),
+                        title: activeMode,
+                        startMin: bestGlobalShift.start,
+                        duration: bestGlobalShift.span,
+                        color: colors[bestGlobalUser.pIdx % colors.length],
+                        date: dStr,
+                        personIdx: bestGlobalUser.pIdx
+                    };
+                    
+                    newEvents.push(newEv);
+                    events.push(newEv); 
+                    
+                    let sIdx = Math.floor(bestGlobalShift.start / 30);
+                    let eIdx = Math.floor((bestGlobalShift.start + bestGlobalShift.span) / 30);
+                    for (let idx = sIdx; idx < eIdx && idx < 48; idx++) intervalCoverage[bestGlobalDay][idx]++;
+
+                    bestGlobalUser.weeklyMins -= bestGlobalShift.paid;
+                    bestGlobalUser.dailyMins[bestGlobalDay] += bestGlobalShift.paid;
+                    madeAssignment = true;
+                }
+            } 
+        } 
+
+        // Final Trimming Pass: Cut and trim all newly generated working events around any OFF variations
+        let latestAllEvs = typeof unrollEvents === 'function' ? unrollEvents() : events;
+        let finalEventsList = [];
+
+        for (let ev of events) {
+            if (weekDates.includes(ev.date) && !isOffEvent(ev)) {
+                let dailyOffs = latestAllEvs.filter(e => 
+                    getStorageKey(e.date) === getStorageKey(ev.date) && 
+                    Number(e.personIdx) === Number(ev.personIdx) && 
+                    isOffEvent(e)
+                );
+                if (dailyOffs.length > 0) {
+                    qToUpdate.add(getStorageKey(ev.date));
+                    let validChunks = findAvailableSlots(ev.startMin, Number(ev.startMin) + Number(ev.duration), dailyOffs);
+                    validChunks.forEach(chunk => {
+                        if (chunk.end - chunk.start > 0) {
+                            finalEventsList.push({
+                                ...ev,
+                                id: crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString() + Math.random()),
+                                startMin: chunk.start,
+                                duration: chunk.end - chunk.start
+                            });
+                        }
+                    });
+                } else {
+                    finalEventsList.push(ev);
+                }
+            } else {
+                finalEventsList.push(ev);
+            }
+        }
+        events = finalEventsList;
+
+        for (let e of newEvents) {
+            if (e && e.date) qToUpdate.add(getStorageKey(e.date));
+        }
+        
+        await Promise.all(Array.from(qToUpdate).map(async (q) => {
+            let dayEvents = events.filter(e => getStorageKey(e.date) === q);
+            if (dayEvents.length === 0) {
+                await fetch(`${CALDAV_URL}${q}.json`, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': getAuthHeader() }
+                });
+            } else {
+                let response = await fetch(`${CALDAV_URL}${q}.json`, { 
+                    method: 'PUT', 
+                    headers: { 'Content-Type': 'application/json', 'Authorization': getAuthHeader() }, 
+                    body: JSON.stringify(dayEvents) 
+                });
+                if (!response.ok) throw new Error(`HTTP Error ${response.status} when saving ${q}`);
+            }
+        }));
+
+        render(); 
+        let modal = document.getElementById('schedulingModal');
+        if (modal) modal.style.display = 'none';
+
+    } catch (err) {
+        console.error("MakeSchedule Error:", err);
+        alert("An error occurred while generating or saving the schedule. Please check the console for details.");
+    } finally { 
+        window.isScheduling = false; 
+    }
+});
