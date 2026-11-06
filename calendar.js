@@ -5,6 +5,8 @@
   
 //    THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
 //    AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
+//
+// coverage hours can be like: 9-10,2=8:30-1:30,3=8:30-1:30   OR 8-22 
 //  ============================================================================ 
 const hostname = window.location.hostname || "127.0.0.1";
 const CALDAV_URL = window.location.origin + '/calendar/';
@@ -1976,6 +1978,98 @@ document.getElementById('btnMakeSchedule')?.addEventListener('click', async () =
 
         const isOffEvent = (e) => /\bOFF\b/i.test(e.title || "") || (e.title || "").toUpperCase().includes("OFF");
 
+        const parseTimePart = (tStr) => {
+            let m = tStr.trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
+            if (!m) return null;
+            let h = parseInt(m[1], 10);
+            let mins = m[2] ? parseInt(m[2], 10) : 0;
+            let mer = m[3] ? m[3].toLowerCase() : null;
+            let hasLeadingZero = m[1].length === 2 && m[1].startsWith('0');
+            if (h > 24 || mins < 0 || mins >= 60) return null;
+            return { h, mins, mer, hasLeadingZero };
+        };
+
+        const parseShiftList = (rawStr) => {
+            if (!rawStr || typeof rawStr !== 'string') return [];
+            let trimmed = rawStr.trim();
+            if (!trimmed || /^(default|clear|none)$/i.test(trimmed)) return [];
+
+            let parts = trimmed.split(',');
+            let explicitEntries = [];
+            let defaultEntries = [];
+            let explicitDaysSet = new Set();
+
+            for (let part of parts) {
+                part = part.trim();
+                if (!part) continue;
+
+                let dayIdx = null;
+                let rangeStr = part;
+
+                if (part.includes('=')) {
+                    let eqParts = part.split('=');
+                    if (eqParts.length !== 2) continue;
+                    let dNum = parseInt(eqParts[0].trim(), 10);
+                    if (isNaN(dNum) || dNum < 1 || dNum > 7) continue;
+                    dayIdx = dNum - 1; // 1 = Sunday (0), 2 = Monday (1), ..., 7 = Saturday (6)
+                    rangeStr = eqParts[1].trim();
+                }
+
+                let dashParts = rangeStr.split('-');
+                if (dashParts.length !== 2) continue;
+
+                let sToken = parseTimePart(dashParts[0]);
+                let eToken = parseTimePart(dashParts[1]);
+                if (!sToken || !eToken) continue;
+
+                let sH = sToken.h;
+                let eH = eToken.h;
+
+                if (sToken.mer === 'am' && sH === 12) sH = 0;
+                else if (sToken.mer === 'pm' && sH < 12) sH += 12;
+
+                if (eToken.mer === 'am' && eH === 12) eH = 0;
+                else if (eToken.mer === 'pm' && eH < 12) eH += 12;
+
+                // Treat 1-5 without AM/PM or leading zero as PM (e.g. 1:15-3:15 -> 13:15-15:15)
+                if (!sToken.mer && !sToken.hasLeadingZero && sH >= 1 && sH <= 5) {
+                    let tentativeStartMin = (sH + 12) * 60 + sToken.mins;
+                    let rawEndMin = eH * 60 + eToken.mins;
+                    if (!(eH > 12 && tentativeStartMin >= rawEndMin)) {
+                        sH += 12;
+                    }
+                }
+
+                let startMin = sH * 60 + sToken.mins;
+                let endMin = eH * 60 + eToken.mins;
+
+                // If end <= start in 12h format (e.g. 8-7 or 1:15-3:15), roll end into PM (+12h)
+                if (!eToken.mer && !eToken.hasLeadingZero && eH <= 12 && endMin <= startMin) {
+                    eH += 12;
+                    endMin = eH * 60 + eToken.mins;
+                }
+
+                let span = endMin - startMin;
+                if (span <= 0) continue;
+
+                if (dayIdx !== null) {
+                    explicitDaysSet.add(dayIdx);
+                    explicitEntries.push({ start: startMin, span: span, days: [dayIdx] });
+                } else {
+                    defaultEntries.push({ start: startMin, span: span });
+                }
+            }
+
+            let fallbackDays = [0, 1, 2, 3, 4, 5, 6].filter(d => !explicitDaysSet.has(d));
+            let finalShifts = [...explicitEntries];
+            if (defaultEntries.length > 0 && fallbackDays.length > 0) {
+                for (let def of defaultEntries) {
+                    finalShifts.push({ start: def.start, span: def.span, days: fallbackDays });
+                }
+            }
+            return finalShifts;
+        };
+
         const findAvailableSlots = (rangeStartMin, rangeEndMin, offEvents) => {
             let sortedOffs = [...offEvents]
                 .map(e => ({ startMin: Number(e.startMin), duration: Number(e.duration) }))
@@ -2098,12 +2192,12 @@ document.getElementById('btnMakeSchedule')?.addEventListener('click', async () =
             let restMins = parseFloat(pR) * 60; if (isNaN(restMins)) restMins = 0;
             
             let allowedDays = [];
-            if (pD && pD.toLowerCase() !== 'clear') allowedDays = pD.split(',').map(n => parseInt(n) - 1).filter(n => !isNaN(n));
+            if (pD && pD.toLowerCase() !== 'clear') allowedDays = pD.split(',').map(n => parseInt(n.trim(), 10) - 1).filter(n => !isNaN(n));
             if (allowedDays.length === 0) allowedDays = [1, 2, 3, 4, 5];
 
             let shiftTemplates = [
-                ...parseShiftList(pP_val).map(s => ({ start: s.start, span: s.span, isPref: hasCustomPref })),
-                ...parseShiftList(pC_val).map(s => ({ start: s.start, span: s.span, isPref: false }))
+                ...parseShiftList(pP_val).map(s => ({ start: s.start, span: s.span, days: s.days, isPref: hasCustomPref })),
+                ...parseShiftList(pC_val).map(s => ({ start: s.start, span: s.span, days: s.days, isPref: false }))
             ];
             if (shiftTemplates.length === 0) continue;
 
@@ -2147,11 +2241,12 @@ document.getElementById('btnMakeSchedule')?.addEventListener('click', async () =
                         
                         let curDate = new Date(startDate); curDate.setDate(curDate.getDate() + d);
                         let dStr = weekDates[d];
+                        let dayOfWeek = curDate.getDay();
 
                         let remDaily = u.dailyMaxMins - u.dailyMins[d];
                         if (remDaily <= 0) continue; 
                         
-                        if (!u.allowedDays.includes(curDate.getDay())) continue;
+                        if (!u.allowedDays.includes(dayOfWeek)) continue;
                         
                         let dayEvs = allEvs.filter(e => getStorageKey(e.date) === getStorageKey(dStr) && Number(e.personIdx) === u.pIdx && !isOffEvent(e));
                         let busy = dayEvs.map(e => ({ s: Number(e.startMin), e: Number(e.startMin) + Number(e.duration) }));
@@ -2166,6 +2261,7 @@ document.getElementById('btnMakeSchedule')?.addEventListener('click', async () =
 
                         for (let t of u.templates) {
                             if (phase === 1 && !t.isPref) continue;
+                            if (t.days && !t.days.includes(dayOfWeek)) continue;
 
                             let tStart = t.start;
                             let tEnd = t.start + t.span;
